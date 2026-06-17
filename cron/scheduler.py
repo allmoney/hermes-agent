@@ -1,3 +1,9 @@
+# Phase 92 (jun17): handoff marker detection.
+# When the agent's final response starts with this marker, the
+# scheduler treats the run as a planned checkpoint (not an error)
+# and records last_status='handoff'.
+HANDOFF_MARKER = "[HANDOFF]"
+
 """
 Cron job scheduler - executes due jobs.
 
@@ -2049,6 +2055,20 @@ def tick(verbose: bool = True, adapters=None, loop=None, sync: bool = True) -> i
             try:
                 success, output, final_response, error = run_job(job)
 
+                # Phase 92 (jun17): detect [HANDOFF] marker. A planned checkpoint
+                # (e.g. budget exhaustion with a handoff memo) is not a system
+                # error. Strip the marker from the delivered content and pass
+                # is_handoff=True to mark_job_run so last_status='handoff'
+                # is recorded (and the operator sees a clean handoff report
+                # in Telegram, not a '⚠️ Cron job failed:' alert).
+                is_handoff = False
+                if isinstance(final_response, str):
+                    stripped_resp = final_response.strip()
+                    if stripped_resp.startswith(HANDOFF_MARKER):
+                        final_response = stripped_resp[len(HANDOFF_MARKER):].lstrip()
+                        is_handoff = True
+
+
                 output_file = save_job_output(job["id"], output)
                 if verbose:
                     logger.info("Output saved to: %s", output_file)
@@ -2080,7 +2100,20 @@ def tick(verbose: bool = True, adapters=None, loop=None, sync: bool = True) -> i
                     success = False
                     error = "Agent completed but produced empty response (model error, timeout, or misconfiguration)"
 
-                mark_job_run(job["id"], success, error, delivery_error=delivery_error)
+                # Phase 92 (jun17): 3-state last_status. Pass handoff=True
+                # only when the agent actually wrote a handoff marker, so
+                # existing tests using `assert_called_with` exact-match
+                # continue to see the same call shape for the common case.
+                if is_handoff:
+                    mark_job_run(
+                        job["id"], success, error,
+                        delivery_error=delivery_error, handoff=True,
+                    )
+                else:
+                    mark_job_run(
+                        job["id"], success, error,
+                        delivery_error=delivery_error,
+                    )
                 return True
 
             except Exception as e:

@@ -955,8 +955,14 @@ def remove_job(job_id: str) -> bool:
     return False
 
 
-def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
-                 delivery_error: Optional[str] = None):
+def mark_job_run(
+    job_id: str,
+    success: bool,
+    error: Optional[str] = None,
+    delivery_error: Optional[str] = None,
+    *,
+    handoff: bool = False,
+):
     """
     Mark a job as having been run.
     
@@ -972,7 +978,17 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
             if job["id"] == job_id:
                 now = _hermes_now().isoformat()
                 job["last_run_at"] = now
-                job["last_status"] = "ok" if success else "error"
+                # Phase 92 (jun17): 3-state last_status. A successful run with
+                # handoff=True is a planned checkpoint (e.g. budget exhausted
+                # with a handoff memo) — record it as 'handoff', not 'ok'.
+                # Defensive: success=False overrides handoff — a true failure
+                # should never be reclassified as a planned stop.
+                if not success:
+                    job["last_status"] = "error"
+                elif handoff:
+                    job["last_status"] = "handoff"
+                else:
+                    job["last_status"] = "ok"
                 job["last_error"] = error if not success else None
                 # Track delivery failures separately — cleared on successful delivery
                 job["last_delivery_error"] = delivery_error

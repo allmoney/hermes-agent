@@ -122,11 +122,17 @@ def cron_list(show_all: bool = False):
             print(f"    Workdir:   {workdir}")
 
         # Execution history
+        # Phase 92 (jun17): 3-state last_status display.
+        #   ok       — clean finish, green
+        #   handoff  — planned checkpoint (e.g. budget exhausted + handoff memo), yellow
+        #   error    — system/agent failure, red
         last_status = job.get("last_status")
         if last_status:
             last_run = job.get("last_run_at", "?")
             if last_status == "ok":
                 status_display = color("ok", Colors.GREEN)
+            elif last_status == "handoff":
+                status_display = color("handoff", Colors.YELLOW)
             else:
                 status_display = color(f"{last_status}: {job.get('last_error', '?')}", Colors.RED)
             print(f"    Last run:  {last_run}  {status_display}")
