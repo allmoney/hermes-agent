@@ -1227,16 +1227,27 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
     return due
 
 
-def save_job_output(job_id: str, output: str):
-    """Save job output to file."""
+def save_job_output(job_id: str, output: str, started_at=None):
+    """Save job output to file.
+
+    Args:
+        job_id: cron job id
+        output: markdown output text
+        started_at: optional datetime — the actual job start. When provided
+            it is used as the filename timestamp (e.g. to match the
+            `#cron-{job}-{ts}` run-id footer in the delivered message).
+            When None, falls back to ``_hermes_now()`` (legacy behaviour).
+    """
     ensure_dirs()
     job_output_dir = _job_output_dir(job_id)
     job_output_dir.mkdir(parents=True, exist_ok=True)
     _secure_dir(job_output_dir)
-    
-    timestamp = _hermes_now().strftime("%Y-%m-%d_%H-%M-%S")
+
+    if started_at is None:
+        started_at = _hermes_now()
+    timestamp = started_at.strftime("%Y-%m-%d_%H-%M-%S")
     output_file = job_output_dir / f"{timestamp}.md"
-    
+
     fd, tmp_path = tempfile.mkstemp(dir=str(job_output_dir), suffix='.tmp', prefix='.output_')
     try:
         with os.fdopen(fd, 'w', encoding='utf-8') as f:
@@ -1251,7 +1262,7 @@ def save_job_output(job_id: str, output: str):
         except OSError:
             pass
         raise
-    
+
     return output_file
 
 

@@ -991,3 +991,26 @@ class TestSaveJobOutput:
         with pytest.raises(ValueError, match="output path"):
             save_job_output(str(tmp_cron_dir / "outside"), "# Results")
         assert not (tmp_cron_dir / "outside").exists()
+
+    def test_accepts_started_at_for_filename_match(self, tmp_cron_dir):
+        """save_job_output() must accept started_at so the filename matches
+        the actual job start (e.g. for the `#cron-{job}-{ts}` run-id footer
+        in delivered cron responses). Regression test for the missing
+        parameter on the upstream/main signature.
+        """
+        from cron.jobs import save_job_output as _save
+        started = datetime(2026, 6, 20, 17, 43, 0, tzinfo=timezone.utc)
+        output_file = _save("test-started", "# Run output", started_at=started)
+        assert output_file.exists()
+        assert output_file.name == "2026-06-20_17-43-00.md"
+        assert output_file.read_text() == "# Run output"
+
+    def test_started_at_none_falls_back_to_now(self, tmp_cron_dir):
+        """When started_at is None, save_job_output() should still work
+        (legacy behaviour: timestamp = now).
+        """
+        output_file = save_job_output("test-default", "# default behaviour")
+        assert output_file.exists()
+        # Filename should be the current minute — just check the format
+        assert output_file.name.endswith(".md")
+        assert len(output_file.stem) == len("YYYY-MM-DD_HH-MM-SS")
