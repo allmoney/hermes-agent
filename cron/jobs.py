@@ -3518,14 +3518,22 @@ def _prune_job_output(job_output_dir: Path, keep: int) -> int:
     return deleted
 
 
-def save_job_output(job_id: str, output: str):
-    """Save job output to file."""
+def save_job_output(job_id: str, output: str, *, started_at: Optional[datetime] = None):
+    """Save job output to file.
+
+    When ``started_at`` is supplied, write a sibling JSON sidecar with the
+    wall-clock duration. The dashboard cron table reads this sidecar for the
+    "Среднее (7д)" column. Without it the collector can only compare the
+    output filename with the ``Run Time`` header, which are both produced at
+    save time and therefore collapse most runs to 0s / ``<1с``.
+    """
     ensure_dirs()
     job_output_dir = _job_output_dir(job_id)
     job_output_dir.mkdir(parents=True, exist_ok=True)
     _secure_dir(job_output_dir)
 
-    timestamp = _hermes_now().strftime("%Y-%m-%d_%H-%M-%S")
+    ended_at = _hermes_now()
+    timestamp = ended_at.strftime("%Y-%m-%d_%H-%M-%S")
     output_file = job_output_dir / f"{timestamp}.md"
 
     fd, tmp_path = tempfile.mkstemp(dir=str(job_output_dir), suffix='.tmp', prefix='.output_')
@@ -3542,6 +3550,36 @@ def save_job_output(job_id: str, output: str):
         except OSError:
             pass
         raise
+
+    if started_at is not None:
+        try:
+            duration_seconds = max(0.0, (ended_at - started_at).total_seconds())
+            sidecar_file = output_file.with_suffix(".json")
+            meta = {
+                "job_id": job_id,
+                "started_at": started_at.isoformat(),
+                "ended_at": ended_at.isoformat(),
+                "duration_seconds": duration_seconds,
+                "output_file": str(output_file),
+            }
+            sfd, stmp_path = tempfile.mkstemp(dir=str(job_output_dir), suffix='.json.tmp', prefix='.output_meta_')
+            try:
+                with os.fdopen(sfd, 'w', encoding='utf-8') as sf:
+                    json.dump(meta, sf, ensure_ascii=False, sort_keys=True)
+                    sf.write("\n")
+                    sf.flush()
+                    os.fsync(sf.fileno())
+                atomic_replace(stmp_path, sidecar_file)
+                _secure_file(sidecar_file)
+            except BaseException:
+                try:
+                    os.unlink(stmp_path)
+                except OSError:
+                    pass
+                raise
+        except Exception as exc:
+            # Sidecar analytics must never prevent delivery/output persistence.
+            logger.warning("Failed to write cron output duration sidecar for %s: %s", job_id, exc)
 
     # Bound per-job output growth so long-running deploys don't fill the disk (#52383).
     _prune_job_output(job_output_dir, _cron_output_keep())

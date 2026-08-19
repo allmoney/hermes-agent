@@ -705,6 +705,17 @@ def _format_exec_approval_fallback(
         + ", ".join(choices[:-1]) + f", or {choices[-1]}."
     )
 
+# HANDOFF_PATCH_JUL02_FOOTER_PROVIDER
+# HANDOFF_PATCH_JUL03_FOOTER_PROVIDER_RETURN
+# HANDOFF_PATCH_JUL05_PROVIDER_ERROR_FORWARD
+# HANDOFF_PATCH_JUL05_DEFAULT_ERROR_FORWARD
+_GATEWAY_RATE_LIMIT_DETAIL_RE = re.compile(
+    r"(https?://|\bresets\s+in\s+\d|\bresets\s+at\b|\bavailable\s+balance\b"
+    r"|\bretry[- ]after\b\s*[:=]?\s*\d|\binvoice\b|\bworkspace\b)",
+    re.IGNORECASE,
+)
+
+
 def _gateway_provider_error_reply(text: str) -> str:
     """Map raw provider/API errors to a short user-safe Telegram reply."""
     if _GATEWAY_AUTH_ERROR_RE.search(text):
@@ -718,16 +729,17 @@ def _gateway_provider_error_reply(text: str) -> str:
             "error out of chat; check gateway logs for details or try rephrasing."
         )
     if _GATEWAY_RATE_LIMIT_RE.search(text):
-        return "⏱️ The model provider is rate-limiting requests. Please wait a moment and try again."
+        detail = text.strip()[:600]
+        if _GATEWAY_RATE_LIMIT_DETAIL_RE.search(detail):
+            return f"Provider rate limit:\n\n{detail}"
+        return f"The model provider is rate-limiting requests:\n\n{detail}"
     if _GATEWAY_CONNECTION_ERROR_RE.search(text):
         return (
-            "⚠️ The model server is not responding — it looks like the configured "
+            "The model server is not responding — it looks like the configured "
             "model endpoint is not running or is unreachable."
         )
-    return (
-        "⚠️ The model provider failed after retries. I kept raw provider details "
-        "out of chat; check gateway logs for diagnostics."
-    )
+    detail = text.strip()[:600]
+    return f"Provider error:\n\n{detail}"
 
 
 _GATEWAY_PROVIDER_ERROR_SHAPE_RE = re.compile(

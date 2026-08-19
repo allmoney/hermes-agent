@@ -2507,7 +2507,22 @@ def _is_channel_dm_topic(
     return is_channel
 
 
-def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Optional[str]:
+def _fmt_elapsed(secs: Optional[float]) -> str:
+    """Format a duration in seconds for cron delivery metadata."""
+    if secs is None:
+        return "n/a"
+    if secs < 60:
+        return f"{secs:.0f}s"
+    minutes, seconds = divmod(int(secs), 60)
+    if minutes < 60:
+        return f"{minutes}m {seconds}s"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h {minutes}m"
+
+
+def _deliver_result(
+    job: dict, content: str, adapters=None, loop=None, elapsed_secs: Optional[float] = None
+) -> Optional[str]:
     """
     Deliver job output to the configured target(s) (origin chat, specific platform, etc.).
 
@@ -2566,6 +2581,30 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         )
     else:
         delivery_content = content
+
+    # Attribute the result to the actual model when available. Pool endpoints
+    # expose the real upstream model/base URL through the agent response path.
+    used_model = job.get("_resolved_model") or job.get("model") or "n/a"
+    provider = job.get("_resolved_provider") or ""
+    pool_base_url = job.get("_resolved_pool_base_url") or ""
+    if isinstance(used_model, str) and not used_model.startswith("no "):
+        if pool_base_url:
+            from urllib.parse import urlparse
+            try:
+                parsed = urlparse(
+                    pool_base_url if "://" in pool_base_url else f"//{pool_base_url}"
+                )
+                domain = (parsed.hostname or "").lower().rstrip(".")
+            except Exception:
+                domain = pool_base_url
+            used_model = f"{used_model} ({domain or 'pool'} (pool))"
+        elif provider:
+            used_model = f"{used_model} ({provider})"
+    footer_parts = [f"⚙️ {used_model}"]
+    if elapsed_secs is not None:
+        footer_parts.append(f"⏱ {_fmt_elapsed(elapsed_secs)}")
+    footer_parts.append(f"🔗 {job.get('id', '')}")
+    delivery_content += "\n\n" + " | ".join(footer_parts)
 
     # Extract MEDIA: tags so attachments are forwarded as files, not raw text
     from gateway.platforms.base import BasePlatformAdapter
@@ -5824,6 +5863,17 @@ def run_job(
         
         logger.info("Job '%s' completed successfully", job_name)
 
+        # Make delivery attribution reflect the actual response, not the pool
+        # alias configured for the job.
+        job["_resolved_model"] = (
+            getattr(agent, "_last_response_model", None)
+            or getattr(agent, "_pool_model", None)
+            or getattr(agent, "model", None)
+            or model
+        )
+        job["_resolved_provider"] = getattr(agent, "provider", None) or runtime.get("provider", "")
+        job["_resolved_pool_base_url"] = getattr(agent, "_pool_base_url", None)
+
         # Emit one JSONL line per fire for usage audit.
         _audit_duration_ms = int((time.monotonic() - _audit_t_start) * 1000)
         _audit_response_silent = _is_cron_silence_response(final_response or "")
@@ -6290,6 +6340,7 @@ def _run_one_job_body(
         # below once delivery is done. Defense-in-depth alongside the
         # interpreter-shutdown guard in _deliver_result.
         _deferred_agents: list = []
+        _run_start = time.monotonic()
         try:
             if fire_claim_lost is None:
                 success, output, final_response, error = run_job(
@@ -6472,6 +6523,7 @@ def _run_one_job_body(
                             deliver_content,
                             adapters=adapters,
                             loop=loop,
+                            elapsed_secs=time.monotonic() - _run_start,
                         )
                 except Exception as de:
                     if isinstance(de, _FireClaimLostDuringSideEffect):
@@ -6611,6 +6663,7 @@ def _run_one_job_body(
                     _summarize_cron_failure_for_delivery(job, _err_text),
                     adapters=adapters,
                     loop=loop,
+                    elapsed_secs=time.monotonic() - _run_start if "_run_start" in locals() else None,
                 )
             except Exception as delivery_exc:
                 delivery_error = str(delivery_exc)

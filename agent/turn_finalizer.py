@@ -707,6 +707,12 @@ def finalize_turn(
         "model": agent.model,
         "provider": agent.provider,
         "base_url": agent.base_url,
+        # HANDOFF_PATCH_JUL02_FOOTER_PROVIDER: pass pool metadata through
+        # to the gateway so runtime_footer can render the real upstream
+        # model + base_url instead of the pool placeholder.
+        "pool_model": getattr(agent, "_pool_model", "") or "",
+        "pool_base_url": getattr(agent, "_pool_base_url", "") or "",
+        "_primary_runtime_base_url": agent._primary_runtime.get("base_url") if getattr(agent, "_primary_runtime", None) else None,
         "input_tokens": agent.session_input_tokens,
         "output_tokens": agent.session_output_tokens,
         "cache_read_tokens": agent.session_cache_read_tokens,

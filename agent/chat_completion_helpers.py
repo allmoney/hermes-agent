@@ -923,6 +923,20 @@ def _bedrock_reasoning_stale_floor(model_id: object) -> "float | None":
     return None
 
 
+def _is_local_pool(agent) -> bool:
+    """Check if agent is using the local LLM pool (127.0.0.1:9120)."""
+    try:
+        bu = (getattr(agent, "base_url", "") or "").strip().lower()
+        if bu and "127.0.0.1:9120" in bu:
+            return True
+        provider = (getattr(agent, "provider", "") or "").strip().lower()
+        if provider in ("custom:llm-pool", "custom"):
+            return True
+    except Exception:
+        pass
+    return False
+
+
 def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
     """Run one non-streaming LLM request for the active api_mode and return it.
 
@@ -996,6 +1010,21 @@ def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
             api_kwargs.pop("_moa_prepared_request", None)
         return agent.client.chat.completions.create(**api_kwargs)
     request_client = make_client("chat_completion_request")
+    # AUG17_POOL_NONSTREAM_HEADERS: OpenAI SDK 2.x ChatCompletion has no
+    # .headers attribute, so the X-Pool-Model / X-Pool-Base-URL headers
+    # captured by HANDOFF_PATCH_JUL02 are silently lost. Use
+    # with_raw_response to get HTTP headers, then .parse() for the body.
+    _is_pool = _is_local_pool(agent)
+    if _is_pool:
+        try:
+            _raw = request_client.chat.completions.with_raw_response.create(**api_kwargs)
+            _resp = _raw.parse()
+            # Stash headers on agent so the capture code at line ~1833 finds them
+            agent._pool_raw_headers = _raw.headers
+            return _resp
+        except Exception:
+            # Fallback to standard path if with_raw_response fails
+            pass
     return request_client.chat.completions.create(**api_kwargs)
 
 
@@ -1818,6 +1847,36 @@ def interruptible_api_call(agent, api_kwargs: dict):
     # responsive.  See the canonical comment block above ``_stale_streak()``.
     if result["response"] is not None:
         _reset_stale_streak(agent)
+    # HANDOFF_PATCH_JUL02_FOOTER_PROVIDER: capture X-Pool-Model /
+    # X-Pool-Base-URL headers from the local key-pool proxy on the
+    # non-streaming response so the runtime footer can show the real
+    # upstream model + domain instead of the pool placeholder.
+    _resp = result.get("response")
+    _got_headers = False
+    _got_body_model = False
+    if _resp is not None:
+        try:
+            _ns_hdrs = getattr(_resp, "headers", None)
+            # AUG17_POOL_NONSTREAM_HEADERS: OpenAI SDK 2.x ChatCompletion
+            # has no .headers. Fall back to _pool_raw_headers stashed by
+            # _dispatch_nonstreaming_api_request (with_raw_response path).
+            if not _ns_hdrs:
+                _ns_hdrs = getattr(agent, "_pool_raw_headers", None)
+            if _ns_hdrs:
+                agent._pool_model = _ns_hdrs.get("x-pool-model", "") or ""
+                agent._pool_base_url = _ns_hdrs.get("x-pool-base-url", "") or ""
+                _got_headers = True
+            # FALLBACK: OpenAI SDK 2.x ChatCompletion has no .headers,
+            # but ChatCompletion.model is the real upstream model from
+            # the JSON body. Use it when headers are absent.
+            if not getattr(agent, "_pool_model", None):
+                _body_model = getattr(_resp, "model", None)
+                if _body_model and _body_model != "llm-pool-model":
+                    agent._pool_model = _body_model
+                    _got_body_model = True
+        except Exception as _cap_exc:
+            logger.warning("POOL_CAP_NS_FAIL: %s", _cap_exc)
+    # Capture behavior preserved for HANDOFF_PATCH_JUL02_FOOTER_PROVIDER.
     return result["response"]
 
 
@@ -2444,20 +2503,7 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         current_provider = (getattr(agent, "provider", "") or "").strip().lower()
         primary_provider = ((agent._primary_runtime or {}).get("provider") or "").strip().lower()
         if (not fallback_already_active) or (primary_provider and current_provider == primary_provider):
-            # Exponential backoff: keep upstream's 60s first-hit cooldown and
-            # escalate on CONSECUTIVE rate-limits: 60s → 2m → 4m → 8m → ... →
-            # 4h cap. The first 429 must NOT bench the primary for half an
-            # hour — fast primary restore is the common case; escalation only
-            # punishes providers that keep 429ing.
-            # Counter is reset by restore_primary_runtime on successful restore.
-            backoff_count = getattr(agent, "_rate_limit_backoff_count", 0)
-            agent._rate_limit_backoff_count = backoff_count + 1
-            backoff_seconds = min(60 * (2 ** backoff_count), 14400)
-            agent._rate_limited_until = time.monotonic() + backoff_seconds
-            logging.info(
-                "Rate-limit backoff level %d: cooldown %d s (%.1f min, backoff#%d)",
-                backoff_count, backoff_seconds, backoff_seconds / 60, backoff_count + 1,
-            )
+            agent._rate_limited_until = time.monotonic() + 60
     if agent._fallback_index >= len(agent._fallback_chain):
         # Chain exhausted.  If we actually walked a non-empty chain and the
         # failure was NOT a rate-limit/billing event (those already armed
@@ -3932,6 +3978,23 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             agent._capture_credits(response)
             agent._stream_diag_capture_response(_diag, response)
             agent._check_openrouter_cache_status(response)
+            # HANDOFF_PATCH_JUL02_FOOTER_PROVIDER: capture X-Pool-Model /
+            # X-Pool-Base-URL headers from the local key-pool proxy on the
+            # streaming response so the runtime footer can show the real
+            # upstream model + domain instead of the pool placeholder.
+            _pool_hdrs = getattr(getattr(raw_stream, "response", None), "headers", None)
+            _got_headers = False
+            if _pool_hdrs:
+                try:
+                    agent._pool_model = _pool_hdrs.get("x-pool-model", "") or ""
+                    agent._pool_base_url = _pool_hdrs.get("x-pool-base-url", "") or ""
+                    _got_headers = True
+                except Exception as _cap_exc:
+                    logger.warning("POOL_CAP_ST_FAIL: %s", _cap_exc)
+            # Phase jul05: removed loud POOL_CAP_ST info log (was debug-level data
+            # logged at WARNING → flooded agent.log on every streaming completion).
+            # Capture behavior (set agent._pool_model / _pool_base_url) is preserved
+            # because HANDOFF_PATCH_JUL02_FOOTER_PROVIDER still relies on it.
             _writer_token["value"] = claim_stream_writer(agent)
 
         def _accept_stream_chunk(_chunk: Any) -> bool:

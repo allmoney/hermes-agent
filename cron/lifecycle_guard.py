@@ -484,6 +484,12 @@ def _read_referenced_script(path: Path) -> tuple[Optional[str], bool]:
         # guarded read must never crash the guard, so treat either as
         # "nothing to scan" (mirrors the resolve() ValueError guard below).
         return None, False
+    except ValueError:
+        # ValueError: embedded NUL byte in a tokenized path derived from a
+        # script's decoded contents — same phantom-path class as #76762
+        # (there guarded at Path.resolve, here at os.open). An unopenable
+        # phantom path is "nothing to scan", never a crash.
+        return None, False
     try:
         metadata = os.fstat(descriptor)
         if not stat.S_ISREG(metadata.st_mode):

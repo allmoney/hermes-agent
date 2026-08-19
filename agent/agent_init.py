@@ -153,7 +153,7 @@ def _provider_default_routes(provider: str) -> set[str]:
         from hermes_cli.providers import HERMES_OVERLAYS, get_provider
 
         overlay = HERMES_OVERLAYS.get(provider)
-        provider_def = get_provider(provider, allow_network=False)
+        provider_def = get_provider(provider)
         for value in (
             getattr(overlay, "base_url_override", ""),
             getattr(provider_def, "base_url", ""),
@@ -247,11 +247,7 @@ def _context_route_mismatch(
             return active_route not in configured_routes
         # Named/custom providers have no catalog default routes. An empty
         # configured URL with a matching provider identity is still the same
-        # route — agent_init fills base_url from custom_providers before this
-        # check, but gateway display/hygiene paths historically compared the
-        # raw empty model.base_url and falsely dropped model.context_length,
-        # falling through to family defaults (e.g. qwen → 131072) on Discord
-        # session-reset banners while /status still showed the config pin.
+        # route.
         if active_provider and configured_provider == active_provider:
             return False
         return True
@@ -630,6 +626,37 @@ def init_agent(
     agent.quiet_mode = quiet_mode
     agent.tool_progress_mode = tool_progress_mode
     agent.ephemeral_system_prompt = ephemeral_system_prompt
+    # HANDOFF_PATCH_JUN17_AUTO_HANDOFF: per-session inject of pending
+    # handoff memo into the system prompt, then archive so it isn't
+    # re-injected in future sessions. Runs PER-AGENT-INIT (per-session),
+    # not per-gateway-startup, so memos written after the gateway
+    # started are still picked up.
+    try:
+        from agent.auto_handoff import (
+            inject_pending_handoff_into_prompt as _ah_inject,
+            acknowledge_memo as _ah_ack,
+            list_pending_memos as _ah_list,
+        )
+        _ah_block = _ah_inject()
+        if _ah_block:
+            base_p = agent.ephemeral_system_prompt or ""
+            agent.ephemeral_system_prompt = (
+                (base_p + "\n\n" + _ah_block) if base_p else _ah_block
+            )
+            # Archive the injected memo (we ack the LATEST one to match
+            # what we injected; older memos stay for the next session).
+            try:
+                _pending = _ah_list()
+                if _pending:
+                    _ah_ack(_pending[0].stem)
+                    logger.info(
+                        "auto_handoff: injected+acked memo session=%s",
+                        _pending[0].stem,
+                    )
+            except Exception as _ah_ack_err:
+                logger.debug("auto_handoff: ack failed (ignored): %s", _ah_ack_err)
+    except Exception as _ah_err:
+        logger.debug("auto_handoff: inject hook failed (ignored): %s", _ah_err)
     agent.platform = platform  # "cli", "telegram", "discord", "whatsapp", etc.
     agent._user_id = user_id  # Platform user identifier (gateway sessions)
     agent._user_id_alt = user_id_alt  # Optional stable alternate platform identifier
@@ -1071,6 +1098,12 @@ def init_agent(
     agent._stream_writer_token = 0
     agent._stream_writer_tls = threading.local()
     agent._stream_writer_dropped = 0
+
+    # Displayed reasoning text streamed during the current model response,
+    # captured only when a surface consumed it via a reasoning callback. Used
+    # by active-turn redirect to checkpoint what the user actually saw without
+    # ever persisting hidden provider reasoning.
+    agent._current_streamed_reasoning_text = ""
 
     # Optional current-turn user-message override used when the API-facing
     # user message intentionally differs from the persisted transcript

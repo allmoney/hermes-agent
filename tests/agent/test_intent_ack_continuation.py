@@ -118,10 +118,87 @@ def test_all_path_drops_workspace_requirement():
 
 # ── detector: guardrails that hold regardless of workspace ───────────────────
 
+def test_real_final_answer_does_not_fire():
+    a = _agent(True, "chat_completions")
+    final = "Done. The server is healthy and there are no critical errors in the logs."
+    msgs = [{"role": "user", "content": REPRO_USER}]
+    assert not looks_like_codex_intermediate_ack(a, REPRO_USER, final, msgs, require_workspace=False)
+
+
+def test_conversational_reply_without_action_verb_does_not_fire():
+    a = _agent(True, "chat_completions")
+    brainstorm = "I'll help you think through the tradeoffs here."
+    msgs = [{"role": "user", "content": "help me decide"}]
+    assert not looks_like_codex_intermediate_ack(
+        a, "help me decide", brainstorm, msgs, require_workspace=False
+    )
+
+
+def test_continues_after_a_tool_already_ran():
+    """Mode B must still be caught after discovery tools in the same task."""
+    a = _agent(True, "chat_completions")
+    msgs = [
+        {"role": "user", "content": REPRO_USER},
+        {"role": "tool", "content": "health check result"},
+    ]
+    assert looks_like_codex_intermediate_ack(
+        a, REPRO_USER, REPRO_ACK, msgs, require_workspace=False
+    )
+
+
+def test_russian_progressive_continue_after_tools_is_not_a_final_answer():
+    """Regression: «Продолжаю искать …» previously bypassed the RU regex."""
+    a = _agent(True, "chat_completions")
+    msgs = [
+        {"role": "user", "content": "Исправь полный coverage-gate"},
+        {"role": "tool", "content": "parallel subset passed"},
+    ]
+    assert looks_like_codex_intermediate_ack(
+        a,
+        "Исправь полный coverage-gate",
+        "Продолжаю искать конкретный тест и исправляю fixture.",
+        msgs,
+        require_workspace=False,
+    )
 
 
 
 
+def test_long_unfinished_status_report_continues_after_tools():
+    """Length must not let a detailed partial report abandon remaining work."""
+    a = _agent(True, "chat_completions")
+    report = ("Промежуточный отчёт. " * 90) + "Одна часть ещё не закрыта полностью: нужно довести catalog-driven монитор."
+    msgs = [
+        {"role": "user", "content": "Выполни все три пункта до конца"},
+        {"role": "tool", "content": "first implementation committed"},
+    ]
+    assert looks_like_codex_intermediate_ack(
+        a, "Выполни все три пункта до конца", report, msgs, require_workspace=False
+    )
 
 
+def test_unfinished_status_report_continues_after_tools():
+    """A progress report must not end a task that explicitly has follow-up work.
 
+    The former RU detector only matched future-tense action promises.  A short
+    report such as ``Дальше остаётся …`` was treated as a final answer even
+    after successful tools, silently abandoning the unfinished work.
+    """
+    a = _agent(True, "chat_completions")
+    report = "Коммит отправлен. Дальше остаётся довести Web/TMA и выполнить deploy."
+    msgs = [
+        {"role": "user", "content": "Восстанови регрессию до закрытия"},
+        {"role": "tool", "content": "tests passed"},
+    ]
+    assert looks_like_codex_intermediate_ack(
+        a, "Восстанови регрессию до закрытия", report, msgs, require_workspace=False
+    )
+
+
+def test_long_response_is_not_treated_as_an_ack():
+    a = _agent(True, "chat_completions")
+    long_ack = "I will run the check. " + ("x" * 1300)
+    msgs = [{"role": "user", "content": REPRO_USER}]
+    assert not looks_like_codex_intermediate_ack(
+        a, REPRO_USER, long_ack, msgs, require_workspace=False
+    )

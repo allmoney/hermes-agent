@@ -1101,7 +1101,11 @@ def recover_with_credential_pool(
         # Runtime credentials can be resolved by a separate pool instance,
         # leaving this recovery pool without ``current_id``. Match the key
         # that actually failed instead of quarantining a different account.
-        next_entry = _rotate_failed_credential(rotate_status)
+        next_entry = pool.mark_exhausted_and_rotate(
+            status_code=rotate_status,
+            error_context=error_context,
+            api_key_hint=_api_key_hint,
+        )
         if next_entry is not None:
             _ra().logger.info(
                 "Credential %s (billing) — rotated to pool entry %s",
@@ -1120,13 +1124,8 @@ def recover_with_credential_pool(
         # Prefer the entry matching the failing key over the shared current()
         # pointer, for the same attribution reason as above.
         current_entry = None
-        if _credential_id:
-            current_entry = next(
-                (e for e in pool.entries() if e.id == _credential_id),
-                None,
-            )
         if _api_key_hint:
-            current_entry = current_entry or next(
+            current_entry = next(
                 (e for e in pool.entries() if e.runtime_api_key == _api_key_hint),
                 None,
             )
@@ -1139,7 +1138,11 @@ def recover_with_credential_pool(
                 current_last_status,
             )
             rotate_status = status_code if status_code is not None else 429
-            next_entry = _rotate_failed_credential(rotate_status)
+            next_entry = pool.mark_exhausted_and_rotate(
+                status_code=rotate_status,
+                error_context=error_context,
+                api_key_hint=_api_key_hint,
+            )
             if next_entry is not None:
                 _ra().logger.info(
                     "Credential %s (rate limit, pre-exhausted) — rotated to pool entry %s",
@@ -1163,7 +1166,11 @@ def recover_with_credential_pool(
         if not has_retried_429 and not usage_limit_reached:
             return False, True
         rotate_status = status_code if status_code is not None else 429
-        next_entry = _rotate_failed_credential(rotate_status)
+        next_entry = pool.mark_exhausted_and_rotate(
+            status_code=rotate_status,
+            error_context=error_context,
+            api_key_hint=_api_key_hint,
+        )
         if next_entry is not None:
             _ra().logger.info(
                 "Credential %s (rate limit) — rotated to pool entry %s",
@@ -1235,10 +1242,7 @@ def recover_with_credential_pool(
         # the shared pointer can reference a different, healthy entry, and
         # refreshing it would consume that entry's single-use refresh token
         # (or mark it exhausted on failure) for a failure it never had.
-        refresh_kwargs = {"api_key_hint": _api_key_hint}
-        if _credential_id:
-            refresh_kwargs["credential_id"] = _credential_id
-        refreshed = pool.try_refresh_matching(**refresh_kwargs)
+        refreshed = pool.try_refresh_matching(api_key_hint=_api_key_hint)
         if refreshed is not None:
             # ``try_refresh_matching()`` re-mints a fresh OAuth token and reports
             # success even when the upstream keeps rejecting it — a single-entry
@@ -1270,7 +1274,11 @@ def recover_with_credential_pool(
         # Refresh failed — rotate to next credential instead of giving up.
         # The failed entry is already marked exhausted by the refresh attempt.
         rotate_status = status_code if status_code is not None else 401
-        next_entry = _rotate_failed_credential(rotate_status)
+        next_entry = pool.mark_exhausted_and_rotate(
+            status_code=rotate_status,
+            error_context=error_context,
+            api_key_hint=_api_key_hint,
+        )
         if next_entry is not None:
             _ra().logger.info(
                 "Credential %s (auth refresh failed) — rotated to pool entry %s",
@@ -1748,7 +1756,6 @@ def restore_primary_runtime(agent) -> bool:
         # ── Reset fallback chain for the new turn ──
         agent._fallback_activated = False
         agent._fallback_index = 0
-        agent._rate_limit_backoff_count = 0  # reset exponential backoff counter
 
         # Reset the stale-call circuit breaker (#58962): the streak measured
         # the FALLBACK provider we're leaving; the restored primary deserves
@@ -3775,17 +3782,66 @@ def looks_like_codex_intermediate_ack(
     always apply, which is what keeps conversational "I'll help you brainstorm"
     replies from tripping it.
     """
-    if any(isinstance(msg, dict) and msg.get("role") == "tool" for msg in messages):
-        return False
-
+    # MODEB_POSTTOOL_INTENT_ACK_JUL21:
+    # Stock code returned False if ANY prior tool message existed in `messages`.
+    # That only protects the *first* model response of a run. After discovery
+    # tools (reads/searches), Mode B prose ("Пишу…", "I'll write…") with
+    # finish_reason=stop and no tool_calls was unguarded — exactly the
+    # serial «оборвался» loop on strategy_daily_optimize (DB: 21 tool msgs
+    # then assistant stop "Пишу … в том же ходе").
+    # conversation_loop only calls this when the *current* assistant reply
+    # has no tool_calls; prior tool history is expected for multi-step work.
+    # Keep a narrow skip: if the *immediately preceding* non-system message
+    # is already a user "Continue now" nudge we already injected, still allow
+    # re-check (cap is codex_ack_continuations < 2 in the loop).
+    # Do NOT gate on prior role=tool.
     assistant_text = agent._strip_think_blocks(assistant_content or "").strip().lower()
     if not assistant_text:
         return False
-    if len(assistant_text) > 1200:
+    # MODEB_LONG_PARTIAL_REPORT_AUG18: a detailed report can exceed the old
+    # 1200-char ack cap while explicitly admitting that work remains. That
+    # ended this task after a partial delivery even though the next action was
+    # known. Keep the conservative short-reply cap for ordinary prose, but
+    # allow a bounded longer report only with an explicit unfinished-work cue.
+    unfinished_report = bool(re.search(
+        r"(?:ещ[её]\s+не\s+(?:закрыт|заверш[её]н|сделан)|"
+        r"(?:одна|часть)\s+.*(?:не\s+закрыт|остал)|"
+        r"(?:дальше|ещ[её])\s+оста[её]тся|"
+        r"(?:нужно|надо)\s+довести)",
+        assistant_text,
+        re.IGNORECASE,
+    ))
+    if len(assistant_text) > (4000 if unfinished_report else 1200):
         return False
 
+    # MODEB_RU_INTENT_ACK_JUL21: EN + RU future-ack / action verbs so
+    # Telegram RU prose ("Пишу…", "Сейчас сделаю…") is intercepted when
+    # intent_ack_continuation is on for non-codex api_modes.
     has_future_ack = bool(
-        re.search(r"\b(i['’]ll|i will|let me|i can do that|i can help with that)\b", assistant_text)
+        re.search(
+            (
+                r"\b(i['’]ll|i will|let me|i can do that|i can help with that)\b"
+                r"|\b(сейчас|сразу|уже|дальше)\b"
+                r"|(?:^|[\s.,;:!?«\"'(—–-])"
+                r"(пишу|создаю|делаю|проверю|гляну|посмотрю|соберу|допишу|запущу|"
+                r"исправлю|обновлю|сохраню|добавлю|настрою|продолжу|остается|осталось|остались|нужно|надо|"
+                # MODEB_RU_PROGRESSIVE_ACK_JUL22:
+                # MODEB_RU_TESTIR_ACK_JUL24: mid-task "Тестирую…" / "Проверяю…" stop-without-tools
+                # (kwork chat session: msg 457840 finish_reason=stop, no tool_calls). Telegram models can announce
+                # unfinished work in present-progressive form ("Обновляю…",
+                # "работа продолжается") rather than future tense.
+                r"продолжаю|продолжается|обновляю|исправляю|дописываю|запускаю|тестирую|проверяю|"
+                # MODEB_RU_WORKING_ACK_AUG01: catch present-progressive
+                # status/prose such as «Теперь фиксирую картину… работаю с
+                # index.html/app.js», which previously ended a Telegram turn
+                # after discovery without taking the promised next tool action.
+                r"работаю|фиксирую|"
+                r"сейчас\s+сделаю|сразу\s+(?:пишу|создаю|сделаю)|"
+                r"через\s+execute_code|через\s+write_file)"
+            ),
+            assistant_text,
+            re.IGNORECASE,
+        )
     )
     if not has_future_ack:
         return False
@@ -3810,6 +3866,40 @@ def looks_like_codex_intermediate_ack(
         "walkthrough",
         "report back",
         "summarize",
+        # RU (MODEB_RU_INTENT_ACK_JUL21)
+        "пишу",
+        "тестир",
+        "проверяю",
+        "создаю",
+        "делаю",
+        "провер",
+        "гляну",
+        "посмотр",
+        "собери",
+        "соберу",
+        "допишу",
+        "запущу",
+        "исправ",
+        "обновл",
+        # MODEB_RU_WORKING_ACK_AUG01: must pair the new acknowledgement
+        # forms above with an action marker; otherwise the detector exits
+        # before the opted-in all-api-mode continuation path.
+        "работаю",
+        "фиксирую",
+        "сохран",
+        "добавл",
+        "настро",
+        "продолж",
+        "остается",
+        "осталось",
+        "остались",
+        "выполн",
+        "довести",
+        "execute_code",
+        "write_file",
+        "файл",
+        "скрипт",
+        "cron",
     )
     workspace_markers = (
         "directory",
@@ -3854,6 +3944,79 @@ def looks_like_codex_intermediate_ack(
         marker in assistant_text for marker in workspace_markers
     )
     return user_targets_workspace or assistant_targets_workspace
+
+
+
+def is_stale_assistant_duplicate(
+    messages: List[Dict[str, Any]], assistant_content: str
+) -> bool:
+    """Detect an exact stale assistant draft after a newer user message.
+
+    A provider retry or broken continuation can replay the previous visible
+    assistant text as the answer to a new user turn.  That is never useful
+    progress and, unlike semantic similarity, exact normalized equality is a
+    deliberately narrow and safe signal.  The caller must suppress delivery
+    and request a new tool-backed continuation.
+    """
+    candidate = " ".join(str(assistant_content or "").split())
+    if not candidate:
+        return False
+
+    saw_newer_user = False
+    for message in reversed(messages):
+        if not isinstance(message, dict):
+            continue
+        role = message.get("role")
+        if role == "user":
+            saw_newer_user = True
+            continue
+        if role != "assistant" or not saw_newer_user:
+            continue
+        previous = " ".join(str(message.get("content") or "").split())
+        return bool(previous and previous == candidate)
+    return False
+
+
+# PHASE_COMPLETION_EVIDENCE_GUARD_JUL31: paired with the conversation-loop
+# guard; this helper decides whether a continuation completion has tool evidence.
+def is_unverified_continuation_completion(
+    messages: List[Dict[str, Any]], assistant_content: str
+) -> bool:
+    """Return true for a completion claim produced after a synthetic nudge without tool evidence.
+
+    An intent-ack continuation explicitly tells the model to execute required
+    tools before it reports a final result.  A "Phase X complete" response
+    immediately after that nudge, with no intervening tool message, therefore
+    cannot be evidence-backed.  This deliberately targets claims of completion
+    only; normal text replies and completions after a tool result remain valid.
+    """
+    candidate = " ".join(str(assistant_content or "").split()).lower()
+    if not candidate:
+        return False
+
+    completion_claim = bool(
+        re.search(
+            r"\bphase\s+[a-z0-9_-]+\s+(?:is\s+)?(?:complete|completed|finished)\b"
+            r"|\b(?:stage|этап|фаза)\s+[a-zа-яё0-9_-]+\s+(?:заверш[её]н(?:а)?|готов(?:а)?|complete(?:d)?)\b"
+            r"|\b(?:i\s+(?:have\s+)?completed|i\s+finished|я\s+выполнил|я\s+завершил)\b",
+            candidate,
+            re.IGNORECASE,
+        )
+    )
+    if not completion_claim:
+        return False
+
+    # Search only the current continuation segment.  The flag distinguishes a
+    # runtime-generated nudge from a genuine user turn and prevents the nudge
+    # itself from resetting evidence accounting.
+    for message in reversed(messages):
+        if not isinstance(message, dict):
+            continue
+        if message.get("role") == "tool":
+            return False
+        if message.get("role") == "user":
+            return bool(message.get("_intent_ack_continuation_synthetic"))
+    return False
 
 
 def intent_ack_continuation_mode(agent) -> str:

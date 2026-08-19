@@ -474,15 +474,29 @@ def _escape_mdv2(text: str) -> str:
 
 
 def _strip_mdv2(text: str) -> str:
-    """Strip MarkdownV2 escape backslashes to produce clean plain text.
+    """Strip MarkdownV2 / agent-markdown markers to clean plain text.
 
     Also removes MarkdownV2 formatting markers so the fallback
     doesn't show stray syntax characters from format_message conversion.
+
+    BUNDLED_PATCH_JUL21_RICH_PLAIN_FALLBACK: previously this left raw ATX
+    headers (##), fenced code fences (```), and residual **bold** when the
+    MarkdownV2 path failed after a flood-control race — the user saw literal
+    markdown instead of a readable plain fallback.
     """
+    if not text:
+        return text
+    # Drop fenced code markers (keep body). Handles both raw agent markdown
+    # and format_message output where fences were re-injected.
+    cleaned = re.sub(r"```[^\n]*\n?", "", text)
+    cleaned = cleaned.replace("```", "")
+    # Residual ATX headers if raw agent markdown was passed in
+    cleaned = re.sub(r"(?m)^#{1,6}\s+", "", cleaned)
     # Remove escape backslashes before special characters
-    cleaned = re.sub(r'\\([_*\[\]()~`>#\+\-=|{}.!\\])', r'\1', text)
+    cleaned = re.sub(r'\\([_*\[\]()~`>#\+\-=|{}.!\\])', r'\1', cleaned)
     # Remove standard markdown bold (**text** → text) BEFORE MarkdownV2 bold
     cleaned = re.sub(r'\*\*([^*]+)\*\*', r'\1', cleaned)
+    cleaned = cleaned.replace("**", "")
     # Remove MarkdownV2 bold markers that format_message converted from **bold**
     cleaned = re.sub(r'\*([^*]+)\*', r'\1', cleaned)
     # Remove MarkdownV2 italic markers that format_message converted from *italic*
@@ -492,6 +506,9 @@ def _strip_mdv2(text: str) -> str:
     cleaned = re.sub(r'~([^~]+)~', r'\1', cleaned)
     # Remove MarkdownV2 spoiler markers (||text|| → text)
     cleaned = re.sub(r'\|\|([^|]+)\|\|', r'\1', cleaned)
+    # Horizontal rules left as raw --- after failed rich/MDV2
+    cleaned = re.sub(r"(?m)^---+$", "", cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
     return cleaned
 
 
@@ -633,6 +650,99 @@ _POLLING_GENERATION_CONTEXT: ContextVar[Optional[int]] = ContextVar(
 
 class _PollingLifecycleAbort(RuntimeError):
     """Internal control flow for polling startup fenced by teardown."""
+
+# ---------------------------------------------------------------------------
+# Tool-call leak sanitizer (jul06 patch: tool-call-leak-sanitizer)
+# Defense-in-depth for Telegram-bound output. Strips leaked tool-call
+# JSON fragments (`<tool_call>...</tool_call>`, `<invoke name="..."`,
+# `<minimax>[...]`) that occasionally surface in assistant output when
+# prose + tool_call interleave in the same turn. See skill
+# `devops/telegram-output-discipline` for full rationale.
+#
+# BUNDLED_PATCH_JUL06_TG_TOOL_CALL_SANITIZER (jul06 evening)
+# This patch survives `hermes update` via check-jul06-patches.sh watchdog.
+_STRIP_TOOL_CALL_LEAKS_RE = re.compile(
+    # 1. Pair-matched tags WITH content (greedy enough to span nested).
+    r"<tool_call>\s*\{.*?\}\s*</tool_call>"
+    r'|<invoke\s+name=(?:"[^"]*"|\'[^\']*\')\s*>.*?</invoke>'
+    r"|<minimax>\s*\[.*?\]\s*</minimax>"
+    # 2. Bracket-only orphan forms seen in the wild (jul06 incident screenshots):
+    #    [<minimax>][<invoke name="memory">]
+    #    [/<minimax>][<invoke name="memory">]...</tool_call>
+    # Eat leading whitespace + the bracket pair + everything to EOL,
+    # so the result doesn't leave dangling spaces or trailing text.
+    r"|\s*\[/?<minimax>\]\s*\[<invoke[^>]*>\][^\n]*"
+    # 3. ``<m:think>`` / ``<m:thinking>`` opening/closing tag pairs —
+    #    strip the WHOLE block including content, so reasoning text doesn't
+    #    leak into the visible reply (jul06 bubble screenshot, 20:31).
+    r"|<m:think(?:ing)?>.*?</m:think(?:ing)?>"
+    # 4. Self-closing variant ``<m:think/>`` / ``<m:thinking/>``.
+    r"|<m:think(?:ing)?\s*/>"
+    # 5. Bare ``mm:think>`` / ``mm:thinking>`` — appears when Telegram
+    #    client renders the original ``<m:think>`` as ``mm:think>`` after
+    #    eating the leading ``<`` (only ``m:think`` survives).  Eat the
+    #    prefix plus the rest of the line — we can't find the matching
+    #    close tag in the same shape, so we strip to EOL.
+    r"|\bmm:think(?:ing)?>[^\n]*",
+    re.DOTALL,
+)
+
+# 2. Orphan single-tag strip (applied AFTER the pair-match pass so that
+# `</invoke>` not consumed by a pair match is still removed).
+_ORPHAN_TOOL_TAGS_RE = re.compile(
+    r"\[(?:<minimax>|/<minimax>)\]\s*\[?\s*<invoke[^>]*>?\s*\]?"
+    r"|\s*</?(?:tool_call|invoke|minimax)(?:[^>]*)?>\s*"
+    r"|\s*\[(?:<minimax>|</?minimax>)\][^\n]*</tool_call>\s*"
+    r"|\s*\[<minimax>\]\s*\[<invoke[^>]*>\][^\n]*"
+    # jul06: catch orphan ``</m:think>`` / ``</m:thinking>`` left over from
+    # nested think-tag matching (the pair-match only eats the innermost
+    # pair; the outer close survives if outer open was eaten earlier).
+    r"|\s*</?m:think(?:ing)?>\s*",
+    re.DOTALL,
+)
+
+
+def _sanitize_tool_call_leaks(text: str) -> str:
+    """Strip leaked tool-call JSON/XML fragments from outgoing text.
+
+    Two-pass: first strip pair-matched tags (with content between them),
+    then strip any orphan single tags left behind (e.g. `[/<minimax>]`
+    alone, or trailing `</tool_call>` after a partial match). Each pass
+    is logged with `WARNING` so leaks are observable in gateway.log
+    without spamming user-visible output.
+    """
+    if not text:
+        return text
+    before = text
+    text = _STRIP_TOOL_CALL_LEAKS_RE.sub("", text)
+    text = _ORPHAN_TOOL_TAGS_RE.sub("", text)
+    if text != before:
+        try:
+            _leak_logger.warning(
+                "[Telegram] Stripped tool-call leak from outbound message "
+                "(len_before=%d, len_after=%d)",
+                len(before), len(text),
+            )
+        except Exception:
+            pass
+    return text
+
+
+# Bind a module-local logger (defined lazily to avoid circular imports).
+_leak_logger = logging.getLogger(__name__)
+
+
+def _sanitize_optional_text(text):
+    """Sanitize optional caption/content text.  None passes through as None.
+
+    Centralized chokepoint for all send_* methods that take Optional[str]
+    caption/content (send_voice, send_image, send_document, etc.).  Always
+    returns a sanitized string or None — never raises.  BUNDLED_PATCH_JUL06_TG_TOOL_CALL_SANITIZER.
+    """
+    if text is None:
+        return None
+    return _sanitize_tool_call_leaks(text)
+
 
 
 class TelegramAdapter(BasePlatformAdapter):
@@ -1417,7 +1527,7 @@ class TelegramAdapter(BasePlatformAdapter):
             adapter_allow_from = self.config.extra.get("allow_from")
         if adapter_allow_from is not None:
             allowed = _coerce_allow_set(adapter_allow_from)
-            authorized = user_id in allowed or "*" in allowed
+            return user_id in allowed or "*" in allowed
 
         # Test/custom injection only. The class method named
         # _is_callback_user_authorized is for inline button callbacks and must
@@ -2011,12 +2121,18 @@ class TelegramAdapter(BasePlatformAdapter):
     def _needs_rich_rendering(self, content: str) -> bool:
         """Return True for markdown constructs that the legacy path degrades.
 
-        Keep ordinary replies on the pre-rich MarkdownV2 path so Telegram
+        Keep short ordinary replies on the pre-rich MarkdownV2 path so Telegram
         clients render a consistent font weight/spacing. The rich endpoint is
-        reserved for constructs where raw markdown materially improves output:
+        used for constructs where raw markdown materially improves output:
         pipe tables (MarkdownV2 has no table syntax and rewrites them into
-        bullet lists), GFM task lists, collapsible ``<details>`` blocks, and
-        block math.  Adapted from #45995 (@YonganZhang).
+        bullet lists), GFM task lists, collapsible ``<details>`` blocks,
+        block math, ATX headers, and fenced code blocks.
+
+        BUNDLED_PATCH_JUL21_RICH_PLAIN_FALLBACK: ATX headers (##) and fenced
+        code used to stay on MarkdownV2; when flood control forced a plain
+        fallback the user saw literal ``##`` / `` ``` ``. Prefer Bot API
+        10.1+ ``sendRichMessage`` for structured long replies so headers and
+        fences render natively.
         """
         if not content:
             return False
@@ -2027,6 +2143,11 @@ class TelegramAdapter(BasePlatformAdapter):
         if re.search(r"(?m)^<details\b|^</details>|^<summary\b|^</summary>", content):
             return True
         if "$$" in content:
+            return True
+        # Structured long-form: native headings + fences via rich markdown
+        if re.search(r"(?m)^#{1,6}\s+\S", content):
+            return True
+        if re.search(r"(?m)^```", content):
             return True
         return False
 
@@ -2210,6 +2331,11 @@ class TelegramAdapter(BasePlatformAdapter):
         caller must NOT legacy-resend), or ``None`` to signal "fall back to the
         legacy MarkdownV2 path" (permanent/capability error or DM-topic skip).
         """
+        # BUNDLED_PATCH_JUL06_TG_TOOL_CALL_SANITIZER: rich-send bypass
+        # fix (jul06 evening +2042). Long markdown replies go via the
+        # rich path, not through send() — sanitize here so tool-call
+        # JSON in prose never reaches the Telegram bubble.
+        content = _sanitize_optional_text(content)
         thread_id = self._metadata_thread_id(metadata)
         routing = self._compute_single_send_routing(chat_id, reply_to, metadata, thread_id)
         if routing is None:
@@ -2324,6 +2450,10 @@ class TelegramAdapter(BasePlatformAdapter):
         - transient / unknown → ``SendResult(success=False)`` with retry
           semantics (the message may already be edited; do NOT legacy-resend)
         """
+        # BUNDLED_PATCH_JUL06_TG_TOOL_CALL_SANITIZER: rich-edit bypass
+        # fix (jul06 evening +2042). Streamed rich finalize is a SEPARATE
+        # path from edit_message() — sanitize here too.
+        content = _sanitize_optional_text(content)
         payload: Dict[str, Any] = {
             "chat_id": normalize_telegram_chat_id(chat_id),
             "message_id": int(message_id),
@@ -2362,6 +2492,19 @@ class TelegramAdapter(BasePlatformAdapter):
             if "not modified" in str(exc).lower():
                 return SendResult(success=True, message_id=message_id)
             err_str = str(exc).lower()
+            # BUNDLED_PATCH_JUL21_RICH_PLAIN_FALLBACK: flood / RetryAfter on
+            # rich finalize must fall through to the legacy MarkdownV2 edit
+            # path (return None). Treating flood as "transient no-resend"
+            # left the raw streaming preview as the final message (literal
+            # ## / ```). Legacy edit can wait out short floods and still
+            # apply format_message.
+            retry_after = getattr(exc, "retry_after", None)
+            if retry_after is not None or "retry after" in err_str or "flood" in err_str:
+                logger.warning(
+                    "[%s] rich editMessageText flood/rate-limit — falling back to MarkdownV2 edit: %s",
+                    self.name, exc,
+                )
+                return None
             try:
                 from telegram.error import TimedOut as _TimedOut
             except (ImportError, AttributeError):
@@ -2418,6 +2561,9 @@ class TelegramAdapter(BasePlatformAdapter):
         legacy plain-text draft. A permanent/capability failure additionally
         latches ``_rich_draft_disabled`` so later frames skip the rich attempt.
         """
+        # BUNDLED_PATCH_JUL06_TG_TOOL_CALL_SANITIZER: rich-draft bypass
+        # fix (jul06 evening +2042). Streaming rich drafts bypass send_draft.
+        content = _sanitize_optional_text(content)
         payload: Dict[str, Any] = {
             "chat_id": normalize_telegram_chat_id(chat_id),
             "draft_id": int(draft_id),
@@ -5135,6 +5281,13 @@ class TelegramAdapter(BasePlatformAdapter):
         # Skip whitespace-only text to prevent Telegram 400 empty-text errors.
         if not content or not content.strip():
             return SendResult(success=True, message_id=None)
+
+        # Defense-in-depth: strip leaked tool-call JSON/XML fragments
+        # before any formatting/send path. See `_sanitize_tool_call_leaks`
+        # and skill `devops/telegram-output-discipline`.
+        content = _sanitize_tool_call_leaks(content)
+        if not content or not content.strip():
+            return SendResult(success=True, message_id=None)
         
         try:
             # Bot API 10.1 rich fast-path: send the raw agent markdown via
@@ -5461,6 +5614,11 @@ class TelegramAdapter(BasePlatformAdapter):
         message in place. If the edit fails (message deleted, too old, etc.)
         we drop the cached id and send fresh.
         """
+        # BUNDLED_PATCH_JUL06_TG_TOOL_CALL_SANITIZER: status-bar bypass
+        # fix (jul06 evening +2042). edit_message() sanitizes its own arg,
+        # but the new-bubble branch below does not — sanitize here to
+        # cover both paths.
+        content = _sanitize_optional_text(content)
         key = (str(chat_id), str(status_key))
         cached_id = self._status_message_ids.get(key)
         if cached_id is not None:
@@ -5496,7 +5654,16 @@ class TelegramAdapter(BasePlatformAdapter):
         existing message with the first chunk and send the rest as
         continuation messages, returning the final chunk's id so subsequent
         edits target the most recent visible message.
+
+        Defense-in-depth: strip leaked tool-call JSON/XML fragments here
+        too.  The streaming edit path does NOT route through ``send()``
+        where the sanitizer lives — without this, leaked fragments ride
+        every streaming edit straight to the user (jul06 incident:
+        ``mm:think>`` slipped into the bubble).  BUNDLED_PATCH_JUL06_TG_TOOL_CALL_SANITIZER.
         """
+        content = _sanitize_tool_call_leaks(content)
+        if not content or not content.strip():
+            return SendResult(success=True, message_id=None)
         if not self._bot:
             return SendResult(success=False, error="Not connected")
 
@@ -5574,14 +5741,17 @@ class TelegramAdapter(BasePlatformAdapter):
                 # "Message is not modified" is a no-op, not an error
                 if "not modified" in str(fmt_err).lower():
                     return SendResult(success=True, message_id=message_id)
-                # Fallback: strip MarkdownV2 escapes and retry as clean plain text
+                # Fallback: strip MarkdownV2 escapes and retry as clean plain text.
+                # BUNDLED_PATCH_JUL21_RICH_PLAIN_FALLBACK: strip the already-
+                # converted `formatted` string (headers→bold, tables→bullets),
+                # not raw agent markdown — otherwise ## / ``` survive plain.
                 safe_format_error = _redact_telegram_error_text(fmt_err)
                 logger.warning(
                     "[%s] MarkdownV2 edit failed, falling back to plain text: %s",
                     self.name,
                     safe_format_error,
                 )
-                _plain = _strip_mdv2(content) if content else content
+                _plain = _strip_mdv2(formatted) if formatted else content
                 await self._bot.edit_message_text(
                     chat_id=normalize_telegram_chat_id(chat_id),
                     message_id=int(message_id),
@@ -5617,17 +5787,29 @@ class TelegramAdapter(BasePlatformAdapter):
                 )
                 self._last_overflow_preview[_preview_key] = truncated
                 return SendResult(success=True, message_id=message_id)
-            # Flood control / RetryAfter — short waits are retried inline,
-            # long waits return a failure immediately so streaming can fall back
-            # to a normal final send instead of leaving a truncated partial.
+            # Flood control / RetryAfter — short waits are retried inline.
+            # BUNDLED_PATCH_JUL21_RICH_PLAIN_FALLBACK: on finalize, wait up to
+            # 120s so the formatted final edit can land. Returning flood_control
+            # immediately left the raw streaming preview as the permanent
+            # message (literal ## / ```) because stream_consumer thought the
+            # full text was already visible and skipped re-send.
             retry_after = getattr(e, "retry_after", None)
             if retry_after is not None or "retry after" in err_str:
-                wait = retry_after if retry_after else 1.0
+                wait = float(retry_after) if retry_after else 1.0
                 logger.warning(
-                    "[%s] Telegram flood control, waiting %.1fs",
-                    self.name, wait,
+                    "[%s] Telegram flood control, waiting %.1fs (finalize=%s)",
+                    self.name, wait, finalize,
                 )
-                if wait > 5.0:
+                # BUNDLED_PATCH_JUL21_RICH_PLAIN_FALLBACK: on finalize wait up to
+                # 120s so final edit can land (avoid sticky raw ## preview).
+                # Keep upstream retry_after field for callers that honor it.
+                if wait > 5.0 and not finalize:
+                    return SendResult(
+                        success=False,
+                        error=f"flood_control:{wait}",
+                        retry_after=float(wait),
+                    )
+                if wait > 120.0:
                     return SendResult(
                         success=False,
                         error=f"flood_control:{wait}",
@@ -5635,11 +5817,33 @@ class TelegramAdapter(BasePlatformAdapter):
                     )
                 await asyncio.sleep(wait)
                 try:
-                    await self._bot.edit_message_text(
-                        chat_id=normalize_telegram_chat_id(chat_id),
-                        message_id=int(message_id),
-                        text=content,
-                    )
+                    if finalize:
+                        formatted_retry = self.format_message(content)
+                        try:
+                            await self._bot.edit_message_text(
+                                chat_id=normalize_telegram_chat_id(chat_id),
+                                message_id=int(message_id),
+                                text=formatted_retry,
+                                parse_mode=ParseMode.MARKDOWN_V2,
+                            )
+                        except Exception as md_err:
+                            if "not modified" in str(md_err).lower():
+                                return SendResult(success=True, message_id=message_id)
+                            logger.warning(
+                                "[%s] MarkdownV2 edit after flood wait failed, plain fallback: %s",
+                                self.name, md_err,
+                            )
+                            await self._bot.edit_message_text(
+                                chat_id=normalize_telegram_chat_id(chat_id),
+                                message_id=int(message_id),
+                                text=_strip_mdv2(formatted_retry),
+                            )
+                    else:
+                        await self._bot.edit_message_text(
+                            chat_id=normalize_telegram_chat_id(chat_id),
+                            message_id=int(message_id),
+                            text=content,
+                        )
                     return SendResult(success=True, message_id=message_id)
                 except Exception as retry_err:
                     safe_retry_error = _redact_telegram_error_text(retry_err)
@@ -5685,6 +5889,18 @@ class TelegramAdapter(BasePlatformAdapter):
             )
             return SendResult(success=False, error=safe_error)
 
+    # Marker shown on a truncated streaming preview so the user knows the
+    # response is incomplete.  The final ``_edit_overflow_split`` edits this
+    # message back to the full chunked response, so the marker is only visible
+    # during the streaming window or if the stream hangs before finalizing
+    # (the stale-stream watchdog in stream_consumer.py is the companion fix).
+    _OVERFLOW_PREVIEW_MARKER = "\n\n⏳ ... (стрим продолжается)"
+    # Reserve UTF-16 code units for the marker so the visible preview never
+    # crosses MAX_MESSAGE_LENGTH (Telegram rejects otherwise).  Marker is
+    # 30 visible chars (Cyrillic = 1 UTF-16 unit each) plus ~10-15 for any
+    # MarkdownV2 escaping slack.
+    _OVERFLOW_MARKER_RESERVE = 50
+
     def _truncate_stream_overflow_preview(self, content: str) -> str:
         """Return a one-message preview for oversized streaming edits.
 
@@ -5693,12 +5909,24 @@ class TelegramAdapter(BasePlatformAdapter):
         message id, so the next accumulated-token edit repeats the overflow
         cycle (#48648). Final edits still use ``_edit_overflow_split`` to
         deliver the complete response.
+
+        When the preview is truncated, append a "stream continues" marker so
+        the user can tell the response is in-flight, not complete.  If the
+        stream stalls before finalize, the marker is the only signal.
+
+        BUNDLED_PATCH_JUL20_OVERFLOW_MARKER_SELF: class attrs must be
+        referenced via ``self.`` — bare names raise NameError at runtime and
+        spam gateway/agent/errors.log on every oversized stream edit
+        (bot-error-rate-scanner 838/h on 2026-07-19 21:45).
         """
-        return self.truncate_message(
+        chunks = self.truncate_message(
             content,
-            self.MAX_MESSAGE_LENGTH,
+            self.MAX_MESSAGE_LENGTH - self._OVERFLOW_MARKER_RESERVE,
             len_fn=utf16_len,
-        )[0]
+        )
+        if len(chunks) > 1:
+            return chunks[0] + self._OVERFLOW_PREVIEW_MARKER
+        return chunks[0]
 
     async def _edit_overflow_split(
         self,
@@ -5723,6 +5951,11 @@ class TelegramAdapter(BasePlatformAdapter):
         Falls back to ``SendResult(success=False)`` only if even the first-
         chunk edit fails — that's a real adapter problem, not an overflow.
         """
+        # BUNDLED_PATCH_JUL06_TG_TOOL_CALL_SANITIZER: overflow-split bypass
+        # fix (jul06 evening +2042). Currently called only from edit_message()
+        # (which sanitizes its own arg), but defensive — future direct callers
+        # would leak tool-call JSON in the overflow chunks.
+        content = _sanitize_optional_text(content)
         chunks = self.truncate_message(
             content, self.MAX_MESSAGE_LENGTH, len_fn=utf16_len,
         )
@@ -5754,10 +5987,12 @@ class TelegramAdapter(BasePlatformAdapter):
                             "failed, falling back to plain text: %s",
                             self.name, _redact_telegram_error_text(fmt_err),
                         )
+                        # BUNDLED_PATCH_JUL21_RICH_PLAIN_FALLBACK: strip
+                        # formatted MDV2, not raw agent markdown.
                         await self._bot.edit_message_text(
                             chat_id=normalize_telegram_chat_id(chat_id),
                             message_id=int(message_id),
-                            text=_strip_mdv2(first_chunk),
+                            text=_strip_mdv2(formatted),
                         )
             else:
                 await self._bot.edit_message_text(
@@ -5981,6 +6216,12 @@ class TelegramAdapter(BasePlatformAdapter):
         """
         if not self._bot:
             return SendResult(success=False, error="not_connected")
+
+        # BUNDLED_PATCH_JUL06_TG_TOOL_CALL_SANITIZER: sanitize streaming draft
+        # preview before it reaches the user (separate path from send()).
+        content = _sanitize_tool_call_leaks(content)
+        if not content or not content.strip():
+            return SendResult(success=True, message_id=None)
 
         # Rich draft fast-path (Bot API 10.1 sendRichMessageDraft): render the
         # streaming preview with the same raw markdown the final
@@ -6222,6 +6463,11 @@ class TelegramAdapter(BasePlatformAdapter):
         confirm_id: str, metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         """Render a three-button slash-command confirmation prompt."""
+        # BUNDLED_PATCH_JUL06_TG_TOOL_CALL_SANITIZER: slash-confirm bypass
+        # fix (jul06 evening +2042). `message` is rendered directly into the
+        # preview via format_message() — sanitize before any UI build.
+        if isinstance(message, str):
+            message = _sanitize_tool_call_leaks(message)
         if not self._bot:
             return SendResult(success=False, error="Not connected")
 
@@ -7351,6 +7597,131 @@ class TelegramAdapter(BasePlatformAdapter):
                     )
             return
 
+        # --- B24 callback (b24:create:<task_id>) ---
+        # BUNDLED_PATCH_B24_CREATE_CALLBACK (restored 2026-07-22):
+        # hermes update wipes this handler; watchdog re-applies.
+        # Button from tophouse-task-notify.py: callback_data=b24:create:<task_id>
+        if data.startswith("b24:create:"):
+            try:
+                task_id = int(data.split(":", 2)[2])
+            except (ValueError, IndexError):
+                await query.answer(text="Invalid task id.")
+                return
+
+            # jul24 UX: first answer is toast only; Telegram often rejects a
+            # second answer with show_alert after that — user saw "создаёт"
+            # and no final result. Put final status into message text +
+            # keyboard, and only use a short toast for the result.
+            try:
+                await query.answer(text="⏳ Создаём в Bitrix24…", show_alert=False)
+            except Exception:
+                pass
+            try:
+                await query.edit_message_reply_markup(
+                    InlineKeyboardMarkup(
+                        [[InlineKeyboardButton("⏳ Создаём…", callback_data=f"b24:busy:{task_id}")]]
+                    )
+                )
+            except Exception:
+                pass
+
+            result_text = "❌ Ошибка"
+            result_markup = None
+            try:
+                import json as _json
+                import urllib.error as _urlerr
+                import urllib.request as _urlreq
+
+                dashboard_url = os.environ.get(
+                    "DASHBOARD_URL", "http://127.0.0.1:9120"
+                ).rstrip("/")
+                payload = _json.dumps({"task_id": task_id}).encode("utf-8")
+                req = _urlreq.Request(
+                    f"{dashboard_url}/tasks/api/b24-create",
+                    data=payload,
+                    headers={
+                        "Content-Type": "application/json",
+                        "Accept": "application/json",
+                        # Loopback service call — CSRF middleware trusts this
+                        # pair (see dashboard app.py protect_task_api_mutations).
+                        "Origin": "http://127.0.0.1:9120",
+                        "X-Hermes-Internal": "b24-gateway",
+                    },
+                    method="POST",
+                )
+                try:
+                    with _urlreq.urlopen(req, timeout=30) as resp:
+                        body = _json.loads(resp.read().decode("utf-8"))
+                except _urlerr.HTTPError as he:
+                    raw = he.read().decode("utf-8", errors="replace")
+                    try:
+                        body = _json.loads(raw)
+                    except Exception:
+                        body = {"ok": False, "error": f"HTTP {he.code}: {raw[:160]}"}
+
+                if body.get("ok"):
+                    task_url = body.get("task_url") or ""
+                    b24_id = body.get("b24_task_id") or body.get("task_id") or ""
+                    result_text = f"✅ Задача создана в B24{(' #' + str(b24_id)) if b24_id else ''}"
+                    if task_url:
+                        result_markup = InlineKeyboardMarkup(
+                            [[InlineKeyboardButton("Открыть в B24 ✅", url=task_url)]]
+                        )
+                    else:
+                        result_markup = InlineKeyboardMarkup(
+                            [[InlineKeyboardButton("Создана ✅", callback_data=f"b24:done:{task_id}")]]
+                        )
+                else:
+                    err = str(body.get("error") or "unknown")
+                    # Keep toast short; full message goes into chat text.
+                    short = err.replace("\n", " ")
+                    if len(short) > 160:
+                        short = short[:157] + "…"
+                    result_text = f"❌ B24: {short}"
+                    result_markup = InlineKeyboardMarkup(
+                        [[
+                            InlineKeyboardButton(
+                                "Повторить ❌",
+                                callback_data=f"b24:create:{task_id}",
+                            )
+                        ]]
+                    )
+            except Exception as exc:
+                result_text = f"❌ Ошибка: {type(exc).__name__}: {str(exc)[:100]}"
+                logger.error("[telegram] b24:create callback failed: %s", exc)
+                result_markup = InlineKeyboardMarkup(
+                    [[
+                        InlineKeyboardButton(
+                            "Повторить ❌",
+                            callback_data=f"b24:create:{task_id}",
+                        )
+                    ]]
+                )
+
+            # Persist result in the message (visible, survives toast drop).
+            try:
+                orig = query.message.text or query.message.caption or ""
+                # Replace previous status footer if re-try
+                lines = [ln for ln in orig.splitlines() if not ln.startswith(("✅ Задача", "❌ B24:", "❌ Ошибка", "⏳ "))]
+                # Don't duplicate huge status; append single status line
+                status_line = result_text if len(result_text) <= 500 else result_text[:497] + "…"
+                new_text = "\n".join(lines).rstrip() + "\n\n" + status_line
+                if len(new_text) > 4000:
+                    new_text = new_text[:3997] + "…"
+                await query.edit_message_text(
+                    text=new_text,
+                    reply_markup=result_markup,
+                    disable_web_page_preview=True,
+                )
+            except Exception:
+                # Fallback: at least swap keyboard
+                try:
+                    if result_markup is not None:
+                        await query.edit_message_reply_markup(result_markup)
+                except Exception:
+                    pass
+            return
+
         # --- Update prompt callbacks ---
         if not data.startswith("update_prompt:"):
             return
@@ -7556,7 +7927,11 @@ class TelegramAdapter(BasePlatformAdapter):
         """Send audio as a native Telegram voice message or audio file."""
         if not self._bot:
             return SendResult(success=False, error="Not connected")
-        
+
+        # BUNDLED_PATCH_JUL06_TG_TOOL_CALL_SANITIZER: sanitize caption text
+        # before it reaches Telegram as part of the media bubble.
+        caption = _sanitize_optional_text(caption)
+
         try:
             if not os.path.exists(audio_path):
                 return SendResult(success=False, error=self._missing_media_path_error("Audio", audio_path))
@@ -7844,6 +8219,10 @@ class TelegramAdapter(BasePlatformAdapter):
         if not self._bot:
             return SendResult(success=False, error="Not connected")
 
+        # BUNDLED_PATCH_JUL06_TG_TOOL_CALL_SANITIZER: sanitize caption text
+        # before it reaches Telegram as part of the media bubble.
+        caption = _sanitize_optional_text(caption)
+
         try:
             if not os.path.exists(image_path):
                 return SendResult(success=False, error=self._missing_media_path_error("Image", image_path))
@@ -7939,6 +8318,10 @@ class TelegramAdapter(BasePlatformAdapter):
         if not self._bot:
             return SendResult(success=False, error="Not connected")
 
+        # BUNDLED_PATCH_JUL06_TG_TOOL_CALL_SANITIZER: sanitize caption text
+        # before it reaches Telegram as part of the media bubble.
+        caption = _sanitize_optional_text(caption)
+
         try:
             if not os.path.exists(file_path):
                 return SendResult(success=False, error=self._missing_media_path_error("File", file_path))
@@ -7993,6 +8376,10 @@ class TelegramAdapter(BasePlatformAdapter):
         if not self._bot:
             return SendResult(success=False, error="Not connected")
 
+        # BUNDLED_PATCH_JUL06_TG_TOOL_CALL_SANITIZER: sanitize caption text
+        # before it reaches Telegram as part of the media bubble.
+        caption = _sanitize_optional_text(caption)
+
         try:
             if not os.path.exists(video_path):
                 return SendResult(success=False, error=self._missing_media_path_error("Video", video_path))
@@ -8046,6 +8433,10 @@ class TelegramAdapter(BasePlatformAdapter):
         """
         if not self._bot:
             return SendResult(success=False, error="Not connected")
+
+        # BUNDLED_PATCH_JUL06_TG_TOOL_CALL_SANITIZER: sanitize caption text
+        # before it reaches Telegram as part of the media bubble.
+        caption = _sanitize_optional_text(caption)
 
         from tools.url_safety import is_safe_url
         if not is_safe_url(image_url):
@@ -8143,7 +8534,11 @@ class TelegramAdapter(BasePlatformAdapter):
         """Send an animated GIF natively as a Telegram animation (auto-plays inline)."""
         if not self._bot:
             return SendResult(success=False, error="Not connected")
-        
+
+        # BUNDLED_PATCH_JUL06_TG_TOOL_CALL_SANITIZER: sanitize caption text
+        # before it reaches Telegram as part of the media bubble.
+        caption = _sanitize_optional_text(caption)
+
         try:
             _anim_thread = self._metadata_thread_id(metadata)
             reply_to_id = self._reply_to_message_id_for_send(reply_to, metadata, reply_to_mode=self._reply_to_mode)
@@ -10700,6 +11095,11 @@ async def _standalone_send(
     parse-mode fallback). Implements the standalone_sender_fn contract so
     deliver=telegram cron jobs succeed when cron runs separately from the
     gateway."""
+    # BUNDLED_PATCH_JUL06_TG_TOOL_CALL_SANITIZER: standalone-sender bypass
+    # fix (jul06 evening +2042). Out-of-process cron delivery bypasses
+    # both send() and edit_message() — sanitize here too.
+    if isinstance(message, str):
+        message = _sanitize_tool_call_leaks(message)
     token = getattr(pconfig, "token", None)
     if not token:
         # Profile-scoped read: honor the secret scope's verdict rather than
@@ -10826,16 +11226,14 @@ def _apply_yaml_config(yaml_cfg: dict, telegram_cfg: dict) -> dict | None:
     if allowed_users is not None:
         if isinstance(allowed_users, list):
             allowed_users = ",".join(str(v) for v in allowed_users)
-        if not _skip_env_bridge and not os.getenv("TELEGRAM_ALLOWED_USERS"):
-            os.environ["TELEGRAM_ALLOWED_USERS"] = str(allowed_users)
+        os.environ["TELEGRAM_ALLOWED_USERS"] = str(allowed_users)
     group_allowed_users = telegram_cfg.get("group_allow_from") or _telegram_extra.get("group_allow_from")
-    if group_allowed_users is not None:
+    if group_allowed_users is not None and not os.getenv("TELEGRAM_GROUP_ALLOWED_USERS"):
         if isinstance(group_allowed_users, list):
             group_allowed_users = ",".join(str(v) for v in group_allowed_users)
-        if not _skip_env_bridge and not os.getenv("TELEGRAM_GROUP_ALLOWED_USERS"):
-            os.environ["TELEGRAM_GROUP_ALLOWED_USERS"] = str(group_allowed_users)
+        os.environ["TELEGRAM_GROUP_ALLOWED_USERS"] = str(group_allowed_users)
     group_allowed_chats = telegram_cfg.get("group_allowed_chats") or _telegram_extra.get("group_allowed_chats")
-    if group_allowed_chats is not None:
+    if group_allowed_chats is not None and not os.getenv("TELEGRAM_GROUP_ALLOWED_CHATS"):
         if isinstance(group_allowed_chats, list):
             group_allowed_chats = ",".join(str(v) for v in group_allowed_chats)
         # extras seed intentionally omitted (shared-key loop bridges group_allowed_chats).

@@ -4095,6 +4095,22 @@ def run_conversation(
                     agent.session_total_tokens += total_tokens
                     agent.session_api_calls += 1
                     agent.session_input_tokens += canonical_usage.input_tokens
+                    # HANDOFF_PATCH_JUN17_AUTO_HANDOFF: checkpoint a pending
+                    # handoff memo after each completed API call. Keep this
+                    # hook best-effort so handoff I/O can never break a turn.
+                    try:
+                        from agent.auto_handoff import check_and_maybe_handoff as _check_handoff
+                        _check_handoff(
+                            session_id=getattr(agent, "session_id", None),
+                            input_tokens=canonical_usage.input_tokens,
+                            cache_read_tokens=canonical_usage.cache_read_tokens,
+                            context_length=getattr(agent, "context_length", None),
+                            model=getattr(agent, "model", None),
+                            source=getattr(agent, "platform", None),
+                            user_id=getattr(agent, "_user_id", None),
+                        )
+                    except Exception:
+                        logger.debug("auto_handoff: checkpoint failed (ignored)", exc_info=True)
                     agent.session_output_tokens += canonical_usage.output_tokens
                     agent.session_cache_read_tokens += canonical_usage.cache_read_tokens
                     agent.session_cache_write_tokens += canonical_usage.cache_write_tokens
@@ -7864,6 +7880,7 @@ def run_conversation(
 
                 from agent.agent_runtime_helpers import (
                     intent_ack_continuation_mode,
+                    is_unverified_continuation_completion,
                 )
 
                 _ack_mode = intent_ack_continuation_mode(agent)
@@ -7894,6 +7911,39 @@ def run_conversation(
                     # continuation consumes the remaining budget.
                     final_response = None
                     continue
+
+                # PHASE_COMPLETION_EVIDENCE_GUARD_JUL31: a continuation nudge
+                # explicitly requests the required tools. A completion claim
+                # without a subsequent tool result is not delivery evidence.
+                if is_unverified_continuation_completion(messages, final_response):
+                    if codex_ack_continuations < 2:
+                        codex_ack_continuations += 1
+                        suppressed_msg = agent._build_assistant_message(
+                            assistant_message, "unverified_completion_suppressed"
+                        )
+                        append_message(messages, suppressed_msg)
+                        messages.append({
+                            "role": "user",
+                            "content": (
+                                "[System: Your completion claim had no tool result after the "
+                                "continuation request and was not delivered. Do not claim that "
+                                "a phase is complete. Call the required tool now, then report "
+                                "only evidence-backed results.]"
+                            ),
+                            "_intent_ack_continuation_synthetic": True,
+                        })
+                        agent._session_messages = messages
+                        logger.warning(
+                            "Suppressed unverified completion claim; continuation=%d",
+                            codex_ack_continuations,
+                        )
+                        final_response = None
+                        continue
+                    logger.error("Blocked repeated unverified completion claim after continuation cap")
+                    final_response = (
+                        "Completion was not verified: the model did not execute a tool after "
+                        "the requested continuation. No phase has been marked complete."
+                    )
 
                 codex_ack_continuations = 0
 

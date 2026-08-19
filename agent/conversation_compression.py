@@ -3138,8 +3138,17 @@ def compress_context(
                 _err = getattr(agent.context_compressor, "_last_summary_error", None) or "unknown error"
                 if getattr(agent, "_last_compression_summary_warning", None) != _err:
                     agent._last_compression_summary_warning = _err
+                    # HANDOFF_PATCH_JUL03_COMPRESSION_PROV_INFO: include endpoint.
+                    _comp = agent.context_compressor
+                    _prov = getattr(_comp, "provider", None) or "auto"
+                    _mdl = getattr(_comp, "summary_model", None) or getattr(_comp, "model", None) or "(unknown)"
+                    _base = getattr(_comp, "base_url", None) or ""
+                    if _base and _base not in str(_prov):
+                        _prov_info = f" [provider={_prov} model={_mdl} base_url={_base}]"
+                    else:
+                        _prov_info = f" [provider={_prov} model={_mdl}]"
                     agent._emit_warning(
-                        f"⚠ Compression aborted: {_err}. "
+                        f"⚠ Compression aborted: {_err}.{_prov_info} "
                         "No messages were dropped — conversation continues unchanged. "
                         "Run /compress to retry, or /new to start a fresh session."
                     )
@@ -3240,8 +3249,12 @@ def compress_context(
         if summary_error:
             if getattr(agent, "_last_compression_summary_warning", None) != summary_error:
                 agent._last_compression_summary_warning = summary_error
+                # HANDOFF_PATCH_JUL03_COMPRESSION_PROV_INFO
+                _comp2 = agent.context_compressor
+                _prov2 = getattr(_comp2, "provider", None) or "auto"
+                _mdl2 = getattr(_comp2, "summary_model", None) or getattr(_comp2, "model", None) or "(unknown)"
                 agent._emit_warning(
-                    f"⚠ Compression summary failed: {summary_error}. "
+                    f"⚠ Compression summary failed: {summary_error} [provider={_prov2} model={_mdl2}]. "
                     "Inserted a fallback context marker."
                 )
         else:
