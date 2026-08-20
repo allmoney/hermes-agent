@@ -3127,7 +3127,14 @@ def _dequeue_pending_event(adapter, session_key: str) -> MessageEvent | None:
     the normal image/STT/document preprocessing path instead of being reduced
     to a placeholder string.
     """
-    return adapter.get_pending_message(session_key)
+    event = adapter.get_pending_message(session_key)
+    if event is not None:
+        try:
+            from gateway.queued_prompt_spool import ack
+            ack((getattr(event, "metadata", None) or {}).get("queue_id"))
+        except Exception:
+            logger.exception("Failed to acknowledge dequeued /queue item")
+    return event
 
 
 _INTERRUPT_REASON_STOP = "Stop requested"
@@ -8785,6 +8792,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """Append a /queue event to the FIFO chain for a session."""
         if adapter is None:
             return
+        # Publish before making the event runnable. The stable id is carried
+        # in metadata so a restart restores the same item without duplication.
+        try:
+            from gateway.queued_prompt_spool import enqueue
+            _meta = getattr(queued_event, "metadata", None) or {}
+            _qid = enqueue(
+                session_key=session_key,
+                text=getattr(queued_event, "text", "") or "",
+                source=queued_event.source.to_dict(),
+                metadata=_meta,
+            )
+            queued_event.metadata["queue_id"] = _qid
+        except Exception:
+            logger.exception("Failed to persist /queue item for %s", session_key)
+            return
         pending_slot = getattr(adapter, "_pending_messages", None)
         if pending_slot is None:
             return
@@ -8825,6 +8847,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # No adapter — push back so we don't silently drop the item.
             overflow.insert(0, next_queued)
         return pending_event
+
+    def _restore_durable_queued_events(self) -> int:
+        """Restore /queue items persisted by a previous gateway process."""
+        try:
+            from gateway.queued_prompt_spool import restore_into_runner
+            count = restore_into_runner(self)
+            if count:
+                logger.info("Restored %d durable /queue item(s)", count)
+            return count
+        except Exception:
+            logger.exception("Failed to restore durable /queue items")
+            return 0
 
     def _queue_depth(self, session_key: str, *, adapter: Any = None) -> int:
         """Total pending /queue items for a session — slot + overflow."""
@@ -20187,6 +20221,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     context_length=agent_result.get("context_length") or None,
                     cwd=os.environ.get("TERMINAL_CWD", ""),
                     turn_seconds=_turn_seconds,
+                    provider=agent_result.get("provider"),
+                    base_url=agent_result.get("base_url"),
                 )
             except Exception as _footer_err:
                 logger.debug("runtime_footer build failed: %s", _footer_err)
@@ -26255,6 +26291,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         if not session_key:
             return
+        try:
+            from gateway.queued_prompt_spool import clear_session
+            clear_session(session_key)
+        except Exception:
+            logger.exception("Failed to clear durable /queue items for %s", session_key)
         # Structural clear: every conversation-scoped field resets in one
         # call — no per-attribute pop-list to drift.
         state = self._peek_session_state(session_key)
@@ -29599,6 +29640,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception as _rpe:
                 logger.debug("Post-delivery cleanup registration failed: %s", _rpe)
 
+        # AUG20_FOOTER_FALLBACK_PROVIDER: inject the live provider/base_url
+        # into the result dict so build_footer_line shows the actual fallback
+        # provider instead of the primary config provider. agent_holder[0] is
+        # the agent instance after run_sync; its provider/base_url are mutated
+        # on fallback activation (chat_completion_helpers.py:2697-2699).
+        if response and isinstance(response, dict) and agent_holder[0]:
+            _ag = agent_holder[0]
+            if not response.get("provider"):
+                response["provider"] = getattr(_ag, "provider", "") or ""
+            if not response.get("base_url"):
+                response["base_url"] = getattr(_ag, "base_url", "") or ""
+
         return response
 
 
@@ -30437,6 +30490,9 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     if not success:
         _shutdown_gateway_health_export(runner)
         return False
+    # Adapters are connected at this point, so durable Telegram /queue items
+    # can be reconstructed into the normal FIFO drain path.
+    runner._restore_durable_queued_events()
     # Recover any pending messages flushed during a previous shutdown (#72680).
     try:
         from gateway.shutdown_flush import recover_pending_to_db
