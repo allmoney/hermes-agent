@@ -18992,6 +18992,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     timeout=_float_env(
                         "HERMES_TURN_LEASE_TIMEOUT", DEFAULT_LEASE_WAIT
                     ),
+                    # aug23 stale-holder guard: break the lease if its holder
+                    # belongs to a generation this gateway already invalidated
+                    # (/stop, /new, session reset) — a zombie holder must not
+                    # wedge every later turn for the full wait budget.
+                    is_generation_stale=lambda stale_gen, _sk=_quick_key: (
+                        not self._is_session_run_current(_sk, stale_gen)
+                    ),
                 )
             except TurnLeaseTimeoutError:
                 # The broad session-context cleanup finally starts later in this

@@ -195,6 +195,7 @@ class SessionTurnLeaseRegistry:
         owner_key: str,
         generation: int,
         timeout: Optional[float] = None,
+        is_generation_stale=None,
     ) -> Optional[TurnLeaseToken]:
         """Acquire the turn lease for ``session_id``, waiting if held.
 
@@ -202,6 +203,12 @@ class SessionTurnLeaseRegistry:
         :class:`TurnLeaseTimeoutError` when the wait budget expires; the caller
         must reject rather than enter the serialized region. Returns ``None``
         for a falsy ``session_id``.
+
+        ``is_generation_stale(gen) -> bool`` (aug23 stale-holder guard): when
+        provided and the current holder's generation is proven stale (the
+        gateway invalidated it via /stop, /new, or session reset), the held
+        lease is force-released instead of making every queued turn fail
+        closed after the full wait budget behind a zombie holder.
         """
         if not session_id:
             return None
@@ -224,6 +231,23 @@ class SessionTurnLeaseRegistry:
                 holder.generation if holder else "?",
                 time.time() - lease.acquired_at if lease.acquired_at else -1.0,
             )
+            # aug23 stale-holder guard: a holder whose run generation was
+            # invalidated can never flush its transcript — holding the lease
+            # only wedges the session. Break it once, here.
+            if (
+                holder is not None
+                and is_generation_stale is not None
+                and int(holder.generation) != int(generation)
+            ):
+                try:
+                    if is_generation_stale(int(holder.generation)):
+                        self.force_release_stale(
+                            session_id,
+                            int(holder.generation),
+                            reason="stale at acquire time",
+                        )
+                except Exception:
+                    logger.debug("stale-holder guard check failed", exc_info=True)
 
         # Lock.release() wakes a waiter while leaving the lock momentarily
         # unlocked. Track every in-progress acquire across that handoff so
@@ -319,6 +343,44 @@ class SessionTurnLeaseRegistry:
         self._leases[new_session_id] = lease
         lease.last_used = time.time()
         token.session_id = new_session_id
+        return True
+
+    def force_release_stale(self, session_id: str, stale_generation: int, reason: str = "") -> bool:
+        """Break a lease still held by a KNOWN-STALE run generation (aug23 guard).
+
+        The #64934 lease is released in the owning turn's ``finally``, so a
+        turn that runs for hours (dead LLM pool retry loop) pins the session
+        for hours even after ``_invalidate_session_run_generation`` marked its
+        generation stale — every later turn fails closed after the full wait
+        budget. When the gateway has PROVEN the holder's generation is no
+        longer current, waiting serves no correctness purpose: the stale turn
+        was already disqualified from flushing. This releases the lock so the
+        next turn can proceed; the stale turn's own ``finally`` release then
+        becomes the documented safe no-op (token not current holder).
+
+        Only call with a generation verified stale via
+        ``_is_session_run_current`` — never to break a LIVE turn's lease.
+        """
+        lease = self._leases.get(session_id)
+        if lease is None or not lease.lock.locked():
+            return False
+        holder = lease.holder
+        if holder is None or int(holder.generation) != int(stale_generation):
+            return False
+        logger.warning(
+            "turn lease force-released on session %s: holder routing key %s "
+            "gen %s belongs to an invalidated run generation (%s) — breaking "
+            "the lease so queued turns can proceed (#64934 stale-holder guard)",
+            session_id,
+            holder.owner_key,
+            holder.generation,
+            reason or "generation invalidated",
+        )
+        lease.holder = None
+        lease.acquired_at = 0.0
+        lease.last_used = time.time()
+        lease.lock.release()
+        holder.released = True
         return True
 
     def release(self, token: Optional[TurnLeaseToken]) -> bool:
