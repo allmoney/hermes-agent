@@ -8691,6 +8691,20 @@ class AIAgent:
             )
             from agent.auxiliary_client import scoped_runtime_main
 
+            # Fallbacks are turn-scoped: after a transient failure, probe the
+            # configured primary again at the start of the next user turn.
+            # The helper existed but was not wired into this production path,
+            # which made a session stay pinned to llm-pool until restart or
+            # an explicit /model switch.
+            if getattr(self, "_fallback_activated", False):
+                restored = self._restore_primary_runtime()
+                if restored:
+                    logger.info(
+                        "Restored primary runtime at turn start: provider=%s model=%s",
+                        getattr(self, "provider", ""),
+                        getattr(self, "model", ""),
+                    )
+
             # The outer token restores the caller's Context even though turn setup
             # replaces the value with the live runtime after fallback restoration.
             # Keep the scope local instead of storing ContextVar tokens on the agent,

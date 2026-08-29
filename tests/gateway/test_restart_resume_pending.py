@@ -315,6 +315,13 @@ class TestResumePendingSystemNote:
         assert "already appear in the history" in note
 
 
+    def test_empty_message_interactive_note_continues_task(self):
+        """Telegram/interactive chats resume autonomous work after a restart."""
+        note = build_resume_recovery_note("restart_timeout", "", interactive=True)
+        assert "Continue the interrupted task autonomously" in note
+        assert "ask what they would like to do next" not in note
+        assert "first step that has no recorded result" in note
+
     def test_resume_note_is_persisted_instead_of_original_empty_message(self):
         """The auto-resume note must not leave an empty row in state.db."""
         message, persisted = _prepare_resume_pending_message(

@@ -2842,6 +2842,14 @@ def run_conversation(
                 # Copilot x-initiator: the first API call of a user turn is
                 # marked "user" so Copilot bills a premium request; tool-loop
                 # follow-ups keep the default "agent" header (#3040).
+                try:
+                    from gateway.session_context import get_session_env
+                    _lane = "background" if get_session_env("HERMES_CRON_SESSION", "") else "interactive"
+                    _lane_headers = dict(api_kwargs.get("extra_headers") or {})
+                    _lane_headers["X-Hermes-Request-Lane"] = _lane
+                    api_kwargs["extra_headers"] = _lane_headers
+                except Exception:
+                    pass
                 if getattr(agent, "_is_user_initiated_turn", False) and agent._is_copilot_url():
                     _xh = dict(api_kwargs.get("extra_headers") or {})
                     _xh["x-initiator"] = "user"

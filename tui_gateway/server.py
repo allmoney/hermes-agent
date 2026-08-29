@@ -4080,6 +4080,20 @@ def _stored_session_runtime_overrides(row: dict | None) -> dict:
 
     overrides: dict = {}
     model = str(row.get("model") or model_config.get("model") or "").strip()
+    # Skip restore when the persisted route is an emergency fallback pin: the
+    # gateway's _sync_session_model_from_agent records the route the fallback
+    # machinery actually served with ``gateway_runtime.fallback_active`` true.
+    # Restoring such a route pins the resumed session to the last fallback
+    # provider forever (observed 2026-08-23). A deliberate /model switch
+    # rewrites gateway_runtime without the flag, so user choice is unaffected.
+    _gw_runtime = model_config.get("gateway_runtime")
+    if isinstance(_gw_runtime, dict) and _gw_runtime.get("fallback_active"):
+        logger.info(
+            "Skipping fallback-pin runtime override for stored session "
+            "(provider=%s); resume will use the configured default",
+            _gw_runtime.get("provider"),
+        )
+        return {}
     # ``billing_provider`` is only the billing bucket — for a custom endpoint it is the
     # bare class ``"custom"``, which agent_init treats as non-routable, so restoring it as
     # the provider override makes ``session.resume`` fail with "No LLM provider configured".

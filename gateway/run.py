@@ -1210,13 +1210,22 @@ def build_resume_recovery_note(
             "unfinished work from the conversation history."
         )
     elif interactive:
+        # AUG26_GATEWAY_AUTONOMOUS_RESUME — preserve autonomous task progress
+        # across a service restart; guarded/restored by check-aug26-resume-continuation-patch.sh.
+        # Telegram/other interactive chats are often used for long autonomous
+        # tasks. A process restart must not turn an in-flight request into a
+        # passive "what next?" prompt: reconstruct the transcript and finish
+        # the first step without a recorded result. The user can still send a
+        # new message, which follows the `message` branch above and takes
+        # precedence over historical work.
         resume_guidance = (
-            "Report to the user that the session was restored "
-            "successfully and ask what they would like to do next."
+            "Continue the interrupted task autonomously to completion. "
+            "Do not ask the user what to do next; report progress or the "
+            "result when there is something meaningful to report."
         )
         tail_guidance = (
-            "Do NOT re-execute old tool calls — skip any "
-            "unfinished work from the conversation history."
+            "Do NOT re-run tool calls whose results already appear in the "
+            "history — resume from the first step that has no recorded result."
         )
     else:
         resume_guidance = (
@@ -3127,14 +3136,9 @@ def _dequeue_pending_event(adapter, session_key: str) -> MessageEvent | None:
     the normal image/STT/document preprocessing path instead of being reduced
     to a placeholder string.
     """
-    event = adapter.get_pending_message(session_key)
-    if event is not None:
-        try:
-            from gateway.queued_prompt_spool import ack
-            ack((getattr(event, "metadata", None) or {}).get("queue_id"))
-        except Exception:
-            logger.exception("Failed to acknowledge dequeued /queue item")
-    return event
+    # Durable queue acknowledgement is deferred until the queued turn succeeds.
+    # Provider errors, cancellation, SIGTERM, and crashes must leave it pending.
+    return adapter.get_pending_message(session_key)
 
 
 _INTERRUPT_REASON_STOP = "Stop requested"
@@ -20230,6 +20234,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     turn_seconds=_turn_seconds,
                     provider=agent_result.get("provider"),
                     base_url=agent_result.get("base_url"),
+                    # HANDOFF_PATCH_AUG29_FOOTER_POOL_PASSTHROUGH: restore the
+                    # jul04 pool pass-through lost in the v0.20.4 merge (the
+                    # original call-site patch had no marker and was never
+                    # committed). Without these, the footer shows the pool
+                    # placeholder "llm-pool-model · 🏁custom:llm-pool (pool)"
+                    # instead of the real upstream model + provider domain.
+                    pool_model=agent_result.get("pool_model"),
+                    pool_base_url=agent_result.get("pool_base_url"),
                 )
             except Exception as _footer_err:
                 logger.debug("runtime_footer build failed: %s", _footer_err)
@@ -29386,6 +29398,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     channel_prompt=next_channel_prompt,
                     message_type=next_message_type,
                 )
+                if pending_event is not None:
+                    queue_id = (getattr(pending_event, "metadata", None) or {}).get("queue_id")
+                    if (
+                        queue_id
+                        and isinstance(followup_result, dict)
+                        and followup_result.get("completed") is True
+                        and not followup_result.get("failed")
+                    ):
+                        from gateway.queued_prompt_spool import ack
+                        ack(queue_id)
                 return _preserve_queued_followup_history_offset(result, followup_result)
         finally:
             # Stop progress sender, interrupt monitor, and notification task

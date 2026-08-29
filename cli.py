@@ -8607,6 +8607,21 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # gateway's top-level keys).
         from hermes_state import SessionDB as _SessionDB
         _stored_runtime = _SessionDB.session_gateway_runtime(session_meta)
+        # Skip restore when the persisted route is an emergency fallback pin:
+        # the gateway's _sync_session_model_from_agent writes the route the
+        # fallback machinery actually served with ``fallback_active: true``.
+        # Restoring such a route would pin the resumed session to the last
+        # fallback provider forever (observed 2026-08-23: a session stuck on
+        # custom:llm-pool after a pool outage, ignoring the config default).
+        # A deliberate /model switch rewrites gateway_runtime without the
+        # flag, so user choice still restores normally.
+        if _stored_runtime.get("fallback_active"):
+            logger.info(
+                "Skipping session model restore for %s: persisted route "
+                "provider=%s is an active-fallback pin, not a /model switch",
+                sid, _stored_runtime.get("provider"),
+            )
+            return
         stored_provider = _stored_runtime.get("provider") or None
         stored_base_url = _stored_runtime.get("base_url") or None
         stored_api_mode = _stored_runtime.get("api_mode") or None

@@ -415,8 +415,22 @@ def format_runtime_footer(
             p = (display_provider or "").strip()
             if pool and not p:
                 p = "custom"
-            if pool or p:
-                parts.append(f"🏁{p} (pool)" if pool else f"🏁{p}")
+            if pool:
+                parts.append(f"🏁{p} (pool)")
+            elif p and p != "custom":
+                parts.append(f"🏁{p}")
+            elif base_url:
+                # AUG20: for non-pool custom providers (provider="custom"),
+                # show the second-level domain from base_url instead of the
+                # generic "custom" label.
+                _domain = _extract_domain(base_url)
+                if _domain:
+                    parts_domain = _domain.split(".")
+                    if len(parts_domain) >= 2:
+                        _sld = ".".join(parts_domain[-2:])
+                    else:
+                        _sld = _domain
+                    parts.append(f"🏁{_sld}")
         elif field == "context_pct":
             if display_context_length and display_context_length > 0 and context_tokens >= 0:
                 pct = max(0, min(100, round((context_tokens / display_context_length) * 100)))

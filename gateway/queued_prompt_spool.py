@@ -4,6 +4,27 @@ The live gateway keeps queued MessageEvents in memory.  This small ledger makes
 those events survive a graceful restart: enqueue publishes before the event is
 made runnable, and dequeue acknowledges only after the event is removed from
 the adapter slot.  Files are profile-local via get_hermes_home().
+
+aug28 durability fix (queue task #7, /reset + /new):
+  - ``clear_session`` was called from ``_clear_conversation_scope`` on every
+    conversation boundary (``/new``, ``/reset``, idle-expiry, compression-
+    exhausted auto-reset).  That destroyed the durable ledger at exactly the
+    moment the user started a fresh session, so any item that had not yet been
+    acked was permanently lost the instant the user typed ``/reset``.
+    The ledger is now boundary-proof: items only leave it on explicit
+    completion (``queue_completed`` / ``ack``) or on an explicit clear.
+  - ``ack`` was called at dequeue time (the moment the event was popped from
+    the adapter's slot).  If the gateway crashed, was OOM-killed, or the run
+    was interrupted between dequeue and completion, the item had already been
+    removed from the spool and could not be recovered.  ``_dequeue_pending_
+    event`` no longer acks; the drain calls ``queue_completed`` after each
+    queued item's turn has been delivered to the agent.
+  - ``restore_into_runner`` could re-inject an item that was still in flight
+    in a live session (e.g. after ``/reset`` mid-run, when the spool still
+    holds the in-flight item because completion had not happened yet).  A
+    process-local ``_started`` set makes restore idempotent: an item whose
+    ``queue_id`` was already injected into a live adapter during this process
+    is skipped rather than duplicated.
 """
 from __future__ import annotations
 
@@ -16,6 +37,12 @@ from pathlib import Path
 from typing import Any
 
 _LOCK = threading.RLock()
+# Process-local: set of queue_ids that have already been injected into a live
+# adapter during THIS gateway process.  Cleared on restart, so a crashed run
+# is re-injected on the next startup (at-least-once delivery).  The set only
+# guards against same-process double-injection (e.g. after a /reset that
+# clears live state but not the spool while the current item is mid-run).
+_started: set[str] = set()
 
 
 def _path() -> Path:
