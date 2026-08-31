@@ -7,6 +7,7 @@ assemble pieces, then combines them with memory and ephemeral prompts.
 import json
 import logging
 import os
+import re
 import sys
 import threading
 import contextvars
@@ -1533,9 +1534,9 @@ def drain_truncation_warnings() -> list:
 _SKILLS_PROMPT_CACHE_MAX = 32
 _SKILLS_PROMPT_CACHE: OrderedDict[tuple, str] = OrderedDict()
 _SKILLS_PROMPT_CACHE_LOCK = threading.Lock()
-# v2: entries gained org provenance fields (org_id/org_author/rel_dir) for M2
-# org-shared skills; older snapshots are discarded and rebuilt.
-_SKILLS_SNAPSHOT_VERSION = 2
+# v3: entries honor optional prompt_category frontmatter for stable virtual
+# grouping without moving skill directories. Older snapshots are rebuilt.
+_SKILLS_SNAPSHOT_VERSION = 3
 
 
 def _skills_prompt_snapshot_path() -> Path:
@@ -1660,6 +1661,12 @@ def _build_snapshot_entry(
         category = "general"
         skill_name = skill_file.parent.name
 
+    prompt_category = str(frontmatter.get("prompt_category") or "").strip()
+    if prompt_category and len(prompt_category) <= 80 and re.fullmatch(
+        r"[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*", prompt_category
+    ):
+        category = prompt_category
+
     platforms = frontmatter.get("platforms") or []
     if isinstance(platforms, str):
         platforms = [platforms]
@@ -1767,6 +1774,27 @@ def _current_session_platform_hint() -> str:
         return ""
 
 
+def _get_skill_prompt_catalog_policy() -> tuple[str, frozenset[str]]:
+    """Return the opt-in, deterministic skill catalog rendering policy."""
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        skills_cfg = (load_config_readonly().get("skills", {}) or {})
+        policy = skills_cfg.get("prompt_catalog", {}) or {}
+        mode = str(policy.get("mode", "full")).strip().lower()
+        raw_names = policy.get("described_names", [])
+        if mode != "hybrid" or not isinstance(raw_names, (list, tuple, set)):
+            return "full", frozenset()
+        names = frozenset(
+            name.strip() for name in raw_names
+            if isinstance(name, str) and name.strip()
+        )
+        return "hybrid", names
+    except Exception as exc:
+        logger.debug("Could not read skills.prompt_catalog policy: %s", exc)
+        return "full", frozenset()
+
+
 def build_skills_system_prompt(
     available_tools: "set[str] | None" = None,
     available_toolsets: "set[str] | None" = None,
@@ -1843,6 +1871,7 @@ def _build_skills_system_prompt_inner(
     # produce distinct cache entries (gateway serves multiple platforms).
     _platform_hint = _current_session_platform_hint()
     disabled = get_disabled_skill_names(_platform_hint or None)
+    catalog_mode, described_names = _get_skill_prompt_catalog_policy()
     project_dirs = project_dirs or []
     cache_key = (
         str(skills_dir),
@@ -1853,6 +1882,8 @@ def _build_skills_system_prompt_inner(
         _platform_hint,
         tuple(sorted(disabled)),
         tuple(sorted(compact_categories or ())),
+        catalog_mode,
+        tuple(sorted(described_names)),
     )
     with _SKILLS_PROMPT_CACHE_LOCK:
         cached = _SKILLS_PROMPT_CACHE.get(cache_key)
@@ -2082,6 +2113,13 @@ def _build_skills_system_prompt_inner(
             "context, so their descriptions are omitted — the skills work "
             "normally and load with skill_view(name) as usual.)"
         )
+    if catalog_mode == "hybrid":
+        hidden_note += (
+            "\n(Hybrid skill catalog: descriptions are shown only for the "
+            "configured high-signal set. Every skill name remains visible "
+            "and loadable with skill_view(name); use skills_list when a "
+            "names-only entry may match.)"
+        )
 
     if not skills_by_category:
         result = ""
@@ -2099,21 +2137,29 @@ def _build_skills_system_prompt_inner(
                 index_lines.append(f"  {category}: {cat_desc}")
             else:
                 index_lines.append(f"  {category}:")
+            names_only: list[str] = []
             for name, desc in sorted(skills_by_category[category], key=lambda x: x[0]):
                 if name in seen:
                     continue
                 seen.add(name)
+                if catalog_mode == "hybrid" and name not in described_names:
+                    names_only.append(name)
+                    continue
                 if desc:
                     index_lines.append(f"    - {name}: {desc}")
                 else:
                     index_lines.append(f"    - {name}")
+            if names_only:
+                index_lines.append(
+                    f"  {category} [names only]: {', '.join(names_only)}"
+                )
 
         result = (
             "## Skills (mandatory)\n"
-            "Before replying, scan the skills below. If a skill matches or is even partially relevant "
-            "to your task, you MUST load it with skill_view(name) and follow its instructions. "
-            "Err on the side of loading — it is always better to have context you don't need "
-            "than to miss critical steps, pitfalls, or established workflows. "
+            "Before replying, scan the skills below and load the minimal sufficient set with "
+            "skill_view(name). Start with the single most specific domain skill. Add another "
+            "skill only for a distinct risk/workflow or when the first skill explicitly points "
+            "to it; do not load skills merely because they are partially related. "
             "Skills contain specialized knowledge — API endpoints, tool-specific commands, "
             "and proven workflows that outperform general-purpose approaches. Load the skill "
             "even if you think you could handle the task with basic tools like web_search or terminal. "
