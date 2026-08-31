@@ -1534,9 +1534,9 @@ def drain_truncation_warnings() -> list:
 _SKILLS_PROMPT_CACHE_MAX = 32
 _SKILLS_PROMPT_CACHE: OrderedDict[tuple, str] = OrderedDict()
 _SKILLS_PROMPT_CACHE_LOCK = threading.Lock()
-# v3: entries honor optional prompt_category frontmatter for stable virtual
-# grouping without moving skill directories. Older snapshots are rebuilt.
-_SKILLS_SNAPSHOT_VERSION = 3
+# v4: entries also carry optional metadata.hermes.offer_scope used for
+# description-only, fail-open project/platform/toolset relevance demotion.
+_SKILLS_SNAPSHOT_VERSION = 4
 
 
 def _skills_prompt_snapshot_path() -> Path:
@@ -1671,6 +1671,18 @@ def _build_snapshot_entry(
     if isinstance(platforms, str):
         platforms = [platforms]
 
+    metadata = frontmatter.get("metadata") if isinstance(frontmatter, dict) else {}
+    hermes_metadata = metadata.get("hermes") if isinstance(metadata, dict) else {}
+    offer_scope = hermes_metadata.get("offer_scope") if isinstance(hermes_metadata, dict) else {}
+    if not isinstance(offer_scope, dict):
+        offer_scope = {}
+
+    def _scope_values(key: str) -> list[str]:
+        raw = offer_scope.get(key, [])
+        if isinstance(raw, str):
+            raw = [raw]
+        return [str(value).strip().lower() for value in raw if str(value).strip()]
+
     entry = {
         "skill_name": skill_name,
         "category": category,
@@ -1678,6 +1690,11 @@ def _build_snapshot_entry(
         "description": description,
         "platforms": [str(p).strip() for p in platforms if str(p).strip()],
         "conditions": extract_skill_conditions(frontmatter),
+        "offer_scope": {
+            "projects": _scope_values("projects"),
+            "platforms": _scope_values("platforms"),
+            "toolsets": _scope_values("toolsets"),
+        },
     }
     if org_id:
         entry["org_id"] = org_id
@@ -1758,6 +1775,51 @@ def _skill_should_show(
     return True
 
 
+def _offer_scope_matches(
+    scope: dict,
+    project_hints: "set[str] | None",
+    platform_hint: str,
+    available_toolsets: "set[str] | None",
+) -> bool:
+    """Fail-open relevance gate used only to omit an entry's description.
+
+    Names remain visible and explicit skill_view loads remain possible. An axis
+    with no runtime hint is ignored so generic sessions do not lose routing
+    descriptions merely because no project was declared.
+    """
+    if not isinstance(scope, dict):
+        return True
+    projects = {str(v).strip().lower() for v in scope.get("projects", []) if str(v).strip()}
+    platforms = {str(v).strip().lower() for v in scope.get("platforms", []) if str(v).strip()}
+    toolsets = {str(v).strip().lower() for v in scope.get("toolsets", []) if str(v).strip()}
+    hints = {str(v).strip().lower() for v in (project_hints or set()) if str(v).strip()}
+    if projects and hints and projects.isdisjoint(hints):
+        return False
+    platform = str(platform_hint or "").strip().lower()
+    if platforms and platform and platform not in platforms:
+        return False
+    if toolsets and available_toolsets is not None:
+        active = {str(v).strip().lower() for v in available_toolsets if str(v).strip()}
+        if toolsets.isdisjoint(active):
+            return False
+    return True
+
+
+def _current_project_hints() -> set[str]:
+    hints: set[str] = set()
+    explicit = os.environ.get("HERMES_SESSION_PROJECT", "")
+    hints.update(part.strip().lower() for part in explicit.split(",") if part.strip())
+    try:
+        cwd = Path.cwd().resolve()
+        for candidate in (cwd, *cwd.parents):
+            if (candidate / ".git").exists():
+                hints.add(candidate.name.lower())
+                break
+    except OSError:
+        pass
+    return hints
+
+
 def _current_session_platform_hint() -> str:
     """Return the active platform without importing the gateway package on CLI startup."""
     platform = os.environ.get("HERMES_PLATFORM") or os.environ.get("HERMES_SESSION_PLATFORM")
@@ -1800,6 +1862,7 @@ def build_skills_system_prompt(
     available_toolsets: "set[str] | None" = None,
     compact_categories: "frozenset[str] | None" = None,
     skills_dir_override: "Path | None" = None,
+    project_hints: "set[str] | None" = None,
 ) -> str:
     """Build a compact skill index for the system prompt.
 
@@ -1853,6 +1916,7 @@ def build_skills_system_prompt(
             available_toolsets,
             compact_categories,
             project_dirs=project_dirs,
+            project_hints=project_hints,
         )
     finally:
         if _home_token is not None:
@@ -1866,12 +1930,14 @@ def _build_skills_system_prompt_inner(
     available_toolsets: "set[str] | None",
     compact_categories: "frozenset[str] | None",
     project_dirs: "list[Path] | None" = None,
+    project_hints: "set[str] | None" = None,
 ) -> str:
     # Include the resolved platform so per-platform disabled-skill lists
     # produce distinct cache entries (gateway serves multiple platforms).
     _platform_hint = _current_session_platform_hint()
     disabled = get_disabled_skill_names(_platform_hint or None)
     catalog_mode, described_names = _get_skill_prompt_catalog_policy()
+    active_project_hints = set(project_hints) if project_hints is not None else _current_project_hints()
     project_dirs = project_dirs or []
     cache_key = (
         str(skills_dir),
@@ -1884,6 +1950,7 @@ def _build_skills_system_prompt_inner(
         tuple(sorted(compact_categories or ())),
         catalog_mode,
         tuple(sorted(described_names)),
+        tuple(sorted(active_project_hints)),
     )
     with _SKILLS_PROMPT_CACHE_LOCK:
         cached = _SKILLS_PROMPT_CACHE.get(cache_key)
@@ -1973,8 +2040,16 @@ def _build_skills_system_prompt_inner(
                     ):
                         continue
                     project_names.add(fm_name)
+                    scoped_desc = (
+                        f"[project] {entry['description']}".strip()
+                        if _offer_scope_matches(
+                            entry.get("offer_scope") or {}, active_project_hints,
+                            _platform_hint, available_toolsets,
+                        )
+                        else ""
+                    )
                     skills_by_category.setdefault(entry["category"], []).append(
-                        (fm_name, f"[project] {entry['description']}".strip())
+                        (fm_name, scoped_desc)
                     )
                 except Exception as e:
                     logger.debug("Error reading project skill %s: %s", skill_file, e)
@@ -2005,6 +2080,11 @@ def _build_skills_system_prompt_inner(
     for entry in visible_entries:
         fm = entry.get("frontmatter_name") or entry.get("skill_name") or ""
         desc = entry.get("description", "")
+        if not _offer_scope_matches(
+            entry.get("offer_scope") or {}, active_project_hints,
+            _platform_hint, available_toolsets,
+        ):
+            desc = ""
         org_id = entry.get("org_id")
         collided = len(name_owners.get(fm, set())) > 1
         if org_id:
@@ -2072,8 +2152,16 @@ def _build_skills_system_prompt_inner(
                 ):
                     continue
                 seen_skill_names.add(frontmatter_name)
+                scoped_desc = (
+                    entry["description"]
+                    if _offer_scope_matches(
+                        entry.get("offer_scope") or {}, active_project_hints,
+                        _platform_hint, available_toolsets,
+                    )
+                    else ""
+                )
                 skills_by_category.setdefault(entry["category"], []).append(
-                    (frontmatter_name, entry["description"])
+                    (frontmatter_name, scoped_desc)
                 )
             except Exception as e:
                 logger.debug("Error reading external skill %s: %s", skill_file, e)
