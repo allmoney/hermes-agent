@@ -23,6 +23,7 @@ from gateway.platforms.base import (
     MessageEvent,
     SendResult,
 )
+from gateway.run import _mark_confirmed_stream_delivery
 from gateway.session import SessionSource, build_session_key
 
 
@@ -241,6 +242,34 @@ class TestQueuedMessageAlreadyStreamed:
         )
 
         assert _already_streamed is True
+
+
+class TestRecursionCapStreamDedup:
+    """The recursion-cap early return must carry streamed-delivery state."""
+
+    def test_exact_streamed_final_is_marked_already_sent(self):
+        result = {"final_response": "same final answer"}
+        consumer = SimpleNamespace(
+            final_response_sent=True,
+            final_content_delivered=True,
+            delivered_final_matches=lambda text: text == "same final answer",
+        )
+
+        marked = _mark_confirmed_stream_delivery(result, consumer)
+
+        assert marked["already_sent"] is True
+
+    def test_stale_preview_does_not_suppress_complete_final(self):
+        result = {"final_response": "complete answer"}
+        consumer = SimpleNamespace(
+            final_response_sent=True,
+            final_content_delivered=True,
+            delivered_final_matches=lambda text: False,
+        )
+
+        marked = _mark_confirmed_stream_delivery(result, consumer)
+
+        assert "already_sent" not in marked
 
 
 # ===================================================================

@@ -4085,6 +4085,49 @@ def _preserve_queued_followup_history_offset(
     return merged
 
 
+def _mark_confirmed_stream_delivery(result: dict, consumer) -> dict:
+    """Mark an early-returned result whose exact final text was streamed.
+
+    The queued-follow-up recursion-cap branch returns from inside ``try`` and
+    therefore skips the normal post-``finally`` duplicate-suppression block.
+    Preserve the same delivery fact there so the outer platform handler does
+    not send the body a second time (with a stale reply anchor/footer).
+    """
+    if not isinstance(result, dict) or result.get("failed") or result.get("response_transformed"):
+        return result
+    final_text = result.get("final_response") or ""
+    if not final_text or final_text == "(empty)" or consumer is None:
+        return result
+
+    delivered = False
+    matcher = getattr(consumer, "delivered_final_matches", None)
+    if getattr(consumer, "final_response_sent", False):
+        delivered = True
+        if callable(matcher):
+            try:
+                delivered = matcher(final_text) is not False
+            except Exception:
+                pass
+    elif getattr(consumer, "final_content_delivered", False):
+        delivered = True
+        if callable(matcher):
+            try:
+                delivered = matcher(final_text) is not False
+            except Exception:
+                pass
+    elif result.get("response_previewed"):
+        has_delivered_text = getattr(consumer, "has_delivered_text", None)
+        if callable(has_delivered_text):
+            try:
+                delivered = bool(has_delivered_text(final_text))
+            except Exception:
+                delivered = False
+
+    if delivered:
+        result["already_sent"] = True
+    return result
+
+
 async def _dispose_unused_adapter(adapter: "BasePlatformAdapter | None") -> None:
     """Best-effort dispose for an adapter that never made it onto ``self.adapters``.
 
@@ -29201,7 +29244,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         merge_pending_message_event(adapter._pending_messages, session_key, pending_event)
                     elif adapter and hasattr(adapter, 'queue_message'):
                         adapter.queue_message(session_key, pending)
-                    return result_holder[0] or {"final_response": response, "messages": history}
+                    _capped_result = result_holder[0] or {"final_response": response, "messages": history}
+                    return _mark_confirmed_stream_delivery(
+                        _capped_result,
+                        stream_consumer_holder[0],
+                    )
 
                 was_interrupted = result.get("interrupted")
                 if not was_interrupted:
