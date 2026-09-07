@@ -2584,22 +2584,38 @@ def _deliver_result(
 
     # Attribute the result to the actual model when available. Pool endpoints
     # expose the real upstream model/base URL through the agent response path.
-    used_model = job.get("_resolved_model") or job.get("model") or "n/a"
-    provider = job.get("_resolved_provider") or ""
+    # Do not render only the generic pool alias: cron footers must match the
+    # interactive runtime footer and include the explicit ``(pool)`` marker.
+    used_model = job.get("_resolved_model") or job.get("model") or ""
+    provider = job.get("_resolved_provider") or job.get("provider") or ""
     pool_base_url = job.get("_resolved_pool_base_url") or ""
-    if isinstance(used_model, str) and not used_model.startswith("no "):
-        if pool_base_url:
-            from urllib.parse import urlparse
-            try:
-                parsed = urlparse(
-                    pool_base_url if "://" in pool_base_url else f"//{pool_base_url}"
-                )
-                domain = (parsed.hostname or "").lower().rstrip(".")
-            except Exception:
-                domain = pool_base_url
-            used_model = f"{used_model} ({domain or 'pool'} (pool))"
-        elif provider:
-            used_model = f"{used_model} ({provider})"
+    from urllib.parse import urlparse
+    try:
+        parsed = urlparse(
+            pool_base_url if "://" in pool_base_url else f"//{pool_base_url}"
+        ) if pool_base_url else None
+        domain = (parsed.hostname or "").lower().rstrip(".") if parsed else ""
+    except Exception:
+        domain = pool_base_url
+    if pool_base_url:
+        # Keep the actual upstream model and provider, not llm-pool-model or
+        # custom:llm-pool. The pool marker is separate and unambiguous.
+        provider_label = domain or provider or "pool"
+        used_model = f"{used_model or 'unknown'} · 🏁{provider_label} (pool)"
+    elif provider:
+        used_model = f"{used_model or 'unknown'} ({provider})"
+    elif job.get("no_agent"):
+        # Pure-script watchdogs never touch a model — say so instead of
+        # rendering a bare "⚙️" with an empty attribution.
+        used_model = f"script:{job.get('script') or '?'} (no LLM)"
+    elif used_model:
+        pass
+    else:
+        # Agent job that died before any model response (dispatch/lease
+        # failure): fall back to the configured route so the footer is never
+        # empty.
+        used_model = "unknown (run failed before model response)"
+
     footer_parts = [f"⚙️ {used_model}"]
     if elapsed_secs is not None:
         footer_parts.append(f"⏱ {_fmt_elapsed(elapsed_secs)}")
@@ -5264,7 +5280,16 @@ def run_job(
                     prefill_messages = None
 
         # Max iterations
-        max_iterations = _cfg.get("agent", {}).get("max_turns") or _cfg.get("max_turns") or 500
+        # sep04: per-job override first (jobs.json stores job["max_turns"],
+        # e.g. polymarket-remediation-autopilot max_turns=30). Previously only
+        # the global config was read, so a job's budget was silently ignored
+        # and runs burned 90 iterations / ~100 min (runaway cron, 3 skipped
+        # ticks). Falls back to the global config, then the 500 default.
+        _job_max_turns = job.get("max_turns")
+        if isinstance(_job_max_turns, int) and _job_max_turns > 0:
+            max_iterations = _job_max_turns
+        else:
+            max_iterations = _cfg.get("agent", {}).get("max_turns") or _cfg.get("max_turns") or 500
 
         # Provider routing
         pr = _cfg.get("provider_routing") or {}
@@ -6518,13 +6543,25 @@ def _run_one_job_body(
                         if not owns_delivery:
                             raise _FireClaimLostDuringSideEffect
                         delivery_attempted = True
-                        delivery_error = _deliver_result(
-                            job,
-                            deliver_content,
-                            adapters=adapters,
-                            loop=loop,
-                            elapsed_secs=time.monotonic() - _run_start,
-                        )
+                        try:
+                            delivery_error = _deliver_result(
+                                job,
+                                deliver_content,
+                                adapters=adapters,
+                                loop=loop,
+                                elapsed_secs=time.monotonic() - _run_start,
+                            )
+                        except TypeError as exc:
+                            # Keep compatibility with lightweight delivery
+                            # doubles/plugins that predate elapsed_secs.
+                            if "elapsed_secs" not in str(exc):
+                                raise
+                            delivery_error = _deliver_result(
+                                job,
+                                deliver_content,
+                                adapters=adapters,
+                                loop=loop,
+                            )
                 except Exception as de:
                     if isinstance(de, _FireClaimLostDuringSideEffect):
                         raise
