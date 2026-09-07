@@ -5890,14 +5890,22 @@ def run_job(
 
         # Make delivery attribution reflect the actual response, not the pool
         # alias configured for the job.
+        # Prefer the metadata returned by turn_finalizer. Pool metadata is
+        # captured on the response path and is not guaranteed to remain on
+        # the agent object for every cron execution route.
         job["_resolved_model"] = (
-            getattr(agent, "_last_response_model", None)
+            result.get("pool_model")
+            or result.get("model")
+            or getattr(agent, "_last_response_model", None)
             or getattr(agent, "_pool_model", None)
-            or getattr(agent, "model", None)
             or model
         )
-        job["_resolved_provider"] = getattr(agent, "provider", None) or runtime.get("provider", "")
-        job["_resolved_pool_base_url"] = getattr(agent, "_pool_base_url", None)
+        job["_resolved_provider"] = result.get("provider") or getattr(agent, "provider", None) or runtime.get("provider", "")
+        job["_resolved_pool_base_url"] = (
+            result.get("pool_base_url")
+            or getattr(agent, "_pool_base_url", None)
+            or result.get("_primary_runtime_base_url")
+        )
 
         # Emit one JSONL line per fire for usage audit.
         _audit_duration_ms = int((time.monotonic() - _audit_t_start) * 1000)
