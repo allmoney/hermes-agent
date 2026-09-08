@@ -1331,6 +1331,106 @@ def _is_telegram_thread_not_found(error: Exception) -> bool:
     return "thread not found" in str(error).lower()
 
 
+def _tg_rich_enabled() -> bool:
+    """Whether Telegram rich messages (Bot API 10.1+) are opted in.
+
+    RICH_ALERTS_SEP02: authoritative source is the loaded gateway platform
+    config (``pconfig.extra``) — the exact dict TelegramAdapter reads, so
+    ``telegram.extra`` / ``gateway.platforms.telegram.extra`` /
+    ``platforms.telegram.extra`` all resolve identically. The raw-YAML read is
+    only a fallback for callers without a loaded gateway config.
+    """
+    try:
+        from gateway.config import load_gateway_config, Platform
+        cfg = load_gateway_config()
+        pconfig = (getattr(cfg, "platforms", {}) or {}).get(Platform.TELEGRAM)
+        extra = getattr(pconfig, "extra", None)
+        if isinstance(extra, dict) and "rich_messages" in extra:
+            return _coerce_rich_flag(extra.get("rich_messages"))
+    except Exception:
+        pass
+    try:
+        from hermes_cli.config import load_config_readonly
+        cfg = load_config_readonly()
+    except Exception:
+        return False
+    gw = (((cfg.get("gateway") or {}).get("platforms") or {}).get("telegram") or {}).get("extra")
+    top = ((cfg.get("platforms") or {}).get("telegram") or {}).get("extra")
+    root = (cfg.get("telegram") or {}).get("extra")
+    merged = {}
+    for src in (gw, root, top):
+        if isinstance(src, dict):
+            merged.update(src)
+    return _coerce_rich_flag(merged.get("rich_messages"))
+
+
+def _coerce_rich_flag(val) -> bool:
+    """Coerce a config value to bool, honouring string forms like "true"."""
+    if isinstance(val, str):
+        return val.strip().lower() in ("1", "true", "yes", "on")
+    return bool(val)
+
+
+class _RichSentMessage:
+    """Minimal stand-in for a PTB Message from a raw sendRichMessage result."""
+
+    def __init__(self, message_id):
+        self.message_id = message_id
+
+
+async def _try_send_telegram_rich(
+    bot, chat_id, message, thread_kwargs, disable_link_previews=False
+):
+    """Try one ``sendRichMessage`` (Bot API 10.1+) with RAW markdown.
+
+    RICH_ALERTS_SEP02: cron/`hermes send` deliveries went out through the
+    legacy MarkdownV2 path only, so tables/headings/task lists arrived as
+    broken pipe-soup while agent replies (gateway adapter) rendered natively.
+
+    Returns ``_RichSentMessage`` on success, or ``None`` to signal "fall back
+    to the legacy MarkdownV2 path". Never raises: any rich failure must leave
+    the caller free to deliver legacy text.
+    """
+    try:
+        from plugins.platforms.telegram.adapter import (
+            TelegramAdapter,
+            _rich_normalize_linebreaks,
+        )
+    except Exception:
+        return None
+
+    if len(message) > TelegramAdapter.RICH_MESSAGE_MAX_CHARS:
+        return None
+    if not callable(getattr(bot, "do_api_request", None)):
+        return None
+
+    payload = {
+        "chat_id": chat_id,
+        "rich_message": {"markdown": _rich_normalize_linebreaks(message)},
+    }
+    payload.update({k: v for k, v in (thread_kwargs or {}).items() if v is not None})
+    if disable_link_previews:
+        payload["link_preview_options"] = {"is_disabled": True}
+
+    try:
+        res = await bot.do_api_request("sendRichMessage", api_kwargs=payload)
+    except Exception as exc:
+        logger.warning(
+            "send_message: sendRichMessage failed (%s) — falling back to MarkdownV2",
+            _sanitize_error_text(exc),
+        )
+        return None
+
+    message_id = None
+    if isinstance(res, dict):
+        message_id = res.get("message_id") or (res.get("result") or {}).get("message_id")
+    else:
+        message_id = getattr(res, "message_id", None)
+    if message_id is None:
+        return None
+    return _RichSentMessage(message_id)
+
+
 async def _send_telegram(token, chat_id, message, media_files=None, thread_id=None, disable_link_previews=False, force_document=False):
     """Send via Telegram Bot API (one-shot, no polling needed).
 
@@ -1442,6 +1542,32 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
         if _cap is not None and _utf16_len(formatted) <= _TELEGRAM_CAPTION_LIMIT:
             _tg_caption = formatted
             formatted = ""  # suppress the separate text send below
+
+        if formatted.strip():
+            # RICH_ALERTS_SEP02: try Bot API 10.1 sendRichMessage FIRST with the
+            # RAW markdown (never `formatted` — MarkdownV2 escaping destroys
+            # table pipes). Tables/headings/task lists then render natively in
+            # cron alerts and `hermes send`, matching agent replies. Any
+            # failure returns None and we fall through to the legacy path
+            # below, so delivery is never lost. No media: rich has no caption
+            # semantics, so keep the legacy caption/media flow intact.
+            _rich_msg = None
+            if (
+                not media_files
+                and not _has_html
+                and _tg_caption is None
+                and _tg_rich_enabled()
+            ):
+                _rich_msg = await _try_send_telegram_rich(
+                    bot,
+                    int_chat_id,
+                    message,
+                    thread_kwargs,
+                    disable_link_previews=disable_link_previews,
+                )
+            if _rich_msg is not None:
+                last_msg = _rich_msg
+                formatted = ""  # delivered via rich — skip legacy text send
 
         if formatted.strip():
             # Chunk *after* formatting: MarkdownV2/HTML escaping inflates the
