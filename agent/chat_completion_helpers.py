@@ -3986,9 +3986,13 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             _got_headers = False
             if _pool_hdrs:
                 try:
-                    agent._pool_model = _pool_hdrs.get("x-pool-model", "") or ""
-                    agent._pool_base_url = _pool_hdrs.get("x-pool-base-url", "") or ""
-                    _got_headers = True
+                    _pool_model_header = _pool_hdrs.get("x-pool-model", "") or ""
+                    _pool_base_url_header = _pool_hdrs.get("x-pool-base-url", "") or ""
+                    if _pool_model_header:
+                        agent._pool_model = _pool_model_header
+                    if _pool_base_url_header:
+                        agent._pool_base_url = _pool_base_url_header
+                    _got_headers = bool(_pool_model_header or _pool_base_url_header)
                 except Exception as _cap_exc:
                     logger.warning("POOL_CAP_ST_FAIL: %s", _cap_exc)
             # Phase jul05: removed loud POOL_CAP_ST info log (was debug-level data
