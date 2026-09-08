@@ -4028,6 +4028,18 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             last_chunk_time["t"] = time.time()
             return True
 
+        def _capture_stream_model(chunk: Any) -> None:
+            """Preserve the upstream model for the runtime footer (parity
+            with the non-streaming body-model fallback at ~line 1872): the
+            footer only consumes this when _is_pool_provider() matches."""
+            nonlocal model_name
+            _chunk_model = getattr(chunk, "model", None)
+            if not _chunk_model:
+                return
+            model_name = _chunk_model
+            if _chunk_model != "llm-pool-model":
+                agent._pool_model = _chunk_model
+
         def _relay_final_response() -> dict[str, Any]:
             tool_calls = [tool_calls_acc[index] for index in sorted(tool_calls_acc)]
             return {
@@ -4152,8 +4164,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 continue
 
             if not chunk.choices:
-                if hasattr(chunk, "model") and chunk.model:
-                    model_name = chunk.model
+                _capture_stream_model(chunk)
                 # Usage comes in the final chunk with empty choices
                 if hasattr(chunk, "usage") and chunk.usage:
                     usage_obj = chunk.usage
@@ -4184,8 +4195,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 continue
 
             delta = chunk.choices[0].delta
-            if hasattr(chunk, "model") and chunk.model:
-                model_name = chunk.model
+            _capture_stream_model(chunk)
 
             # Accumulate reasoning content
             reasoning_text = getattr(delta, "reasoning_content", None) or getattr(delta, "reasoning", None)
