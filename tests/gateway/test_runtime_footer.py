@@ -134,6 +134,52 @@ def test_build_footer_per_platform_off_suppresses():
 
 
 
+def test_build_footer_uses_pool_upstream_metadata():
+    out = build_footer_line(
+        user_config={
+            "display": {
+                "runtime_footer": {
+                    "enabled": True,
+                    "fields": ["model", "provider", "context_pct"],
+                }
+            },
+        },
+        platform_key="telegram",
+        model="llm-pool-model",
+        provider="custom:llm-pool",
+        base_url="http://127.0.0.1:9120/v1",
+        pool_model="openai/gpt-5.6-terra",
+        pool_base_url="https://api.closerouter.dev/v1",
+        context_tokens=66_000,
+        context_length=256_000,
+        cwd="",
+    )
+    assert out == "gpt-5.6-terra · 🏁api.closerouter.dev (pool) · 6% (66k/1050k)"
+    assert "llm-pool-model" not in out
+    assert "custom:llm-pool" not in out
+
+
+def test_build_footer_pool_without_metadata_keeps_configured_alias():
+    out = build_footer_line(
+        user_config={
+            "display": {
+                "runtime_footer": {
+                    "enabled": True,
+                    "fields": ["model", "provider"],
+                }
+            },
+        },
+        platform_key="telegram",
+        model="llm-pool-model",
+        provider="custom:llm-pool",
+        base_url="http://127.0.0.1:9120/v1",
+        context_tokens=0,
+        context_length=None,
+        cwd="",
+    )
+    assert out == "llm-pool-model · 🏁custom:llm-pool (pool)"
+
+
 # ---------------------------------------------------------------------------
 # latency — opt-in wall-clock turn duration
 # ---------------------------------------------------------------------------
