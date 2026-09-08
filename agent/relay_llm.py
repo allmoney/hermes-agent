@@ -475,6 +475,8 @@ class ManagedLlmStream(Iterator[Any]):
             or not runtime.managed_execution_enabled()
         ):
             raw_stream = stream_factory(request)
+            if on_stream_created is not None:
+                on_stream_created(raw_stream)
             if completed_response_predicate is not None and completed_response_predicate(
                 raw_stream
             ):
@@ -482,8 +484,6 @@ class ManagedLlmStream(Iterator[Any]):
                 self._stream = iter(())
             else:
                 self._raw_stream_resource = raw_stream
-                if on_stream_created is not None:
-                    on_stream_created(raw_stream)
                 self._stream = iter(raw_stream)
             return
 
@@ -512,6 +512,8 @@ class ManagedLlmStream(Iterator[Any]):
                         metadata=metadata,
                     )
                 )
+                if on_stream_created is not None:
+                    run_callback(on_stream_created, raw_stream)
                 if (
                     completed_response_predicate is not None
                     and run_callback(
@@ -522,8 +524,6 @@ class ManagedLlmStream(Iterator[Any]):
                     self.final_response = raw_stream
                     self._provider_completed = True
                     return
-                if on_stream_created is not None:
-                    run_callback(on_stream_created, raw_stream)
                 raw_iterator = run_callback(iter, raw_stream)
                 while True:
                     try:

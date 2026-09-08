@@ -52,6 +52,38 @@ def test_relay_request_body_omits_client_timeout(api_mode):
     assert request["timeout"] == 1800.0
 
 
+def test_stream_calls_on_stream_created_before_completed_response(
+    relay_turn, monkeypatch
+):
+    relay, _turn = relay_turn
+    monkeypatch.setattr(relay_llm, "_codec", lambda *_args, **_kwargs: None)
+    events = []
+    completed = SimpleNamespace(choices=[SimpleNamespace(message="done")])
+
+    def provider(_request):
+        return completed
+
+    def on_stream_created(response):
+        events.append(("created", response))
+
+    stream = relay_llm.stream(
+        {"model": "test-model", "messages": []},
+        provider,
+        session_id="session-1",
+        name="custom",
+        model_name="test-model",
+        finalizer=lambda: completed,
+        on_stream_created=on_stream_created,
+        completed_response_predicate=lambda response: bool(
+            getattr(response, "choices", None)
+        ),
+        metadata={"api_mode": "chat_completions"},
+    )
+
+    assert list(stream) == []
+    assert events == [("created", completed)]
+
+
 def test_unintercepted_provider_callback_preserves_client_timeout(
     relay_turn, monkeypatch
 ):
