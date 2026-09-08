@@ -1863,9 +1863,13 @@ def interruptible_api_call(agent, api_kwargs: dict):
             if not _ns_hdrs:
                 _ns_hdrs = getattr(agent, "_pool_raw_headers", None)
             if _ns_hdrs:
-                agent._pool_model = _ns_hdrs.get("x-pool-model", "") or ""
-                agent._pool_base_url = _ns_hdrs.get("x-pool-base-url", "") or ""
-                _got_headers = True
+                _pool_model_header = _ns_hdrs.get("x-pool-model", "") or ""
+                _pool_base_url_header = _ns_hdrs.get("x-pool-base-url", "") or ""
+                if _pool_model_header:
+                    agent._pool_model = _pool_model_header
+                if _pool_base_url_header:
+                    agent._pool_base_url = _pool_base_url_header
+                _got_headers = bool(_pool_model_header or _pool_base_url_header)
             # FALLBACK: OpenAI SDK 2.x ChatCompletion has no .headers,
             # but ChatCompletion.model is the real upstream model from
             # the JSON body. Use it when headers are absent.
