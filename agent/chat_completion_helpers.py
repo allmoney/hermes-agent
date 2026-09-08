@@ -1870,6 +1870,8 @@ def interruptible_api_call(agent, api_kwargs: dict):
                 if _pool_base_url_header:
                     agent._pool_base_url = _pool_base_url_header
                 _got_headers = bool(_pool_model_header or _pool_base_url_header)
+            # SEP08_POOL_METADATA_CAPTURE: non-streaming header capture +
+            # body-model fallback for the runtime footer (b2a09da22a chain).
             # FALLBACK: OpenAI SDK 2.x ChatCompletion has no .headers,
             # but ChatCompletion.model is the real upstream model from
             # the JSON body. Use it when headers are absent.
@@ -3988,6 +3990,8 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             # upstream model + domain instead of the pool placeholder.
             _pool_hdrs = getattr(getattr(raw_stream, "response", None), "headers", None)
             _got_headers = False
+            # SEP08_POOL_METADATA_CAPTURE: streaming header capture for the
+            # runtime footer (fixes 8bfb28ac04 + cd4d8fd086 chain).
             if _pool_hdrs:
                 try:
                     _pool_model_header = _pool_hdrs.get("x-pool-model", "") or ""

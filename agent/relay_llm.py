@@ -475,6 +475,10 @@ class ManagedLlmStream(Iterator[Any]):
             or not runtime.managed_execution_enabled()
         ):
             raw_stream = stream_factory(request)
+            # SEP08_POOL_METADATA_CAPTURE: on_stream_created must run BEFORE
+            # completed_response_predicate — otherwise pool metadata
+            # (X-Pool-Model / X-Pool-Base-URL) is never captured on the
+            # stream->ready-JSON short-circuit path.
             if on_stream_created is not None:
                 on_stream_created(raw_stream)
             if completed_response_predicate is not None and completed_response_predicate(
@@ -513,6 +517,8 @@ class ManagedLlmStream(Iterator[Any]):
                     )
                 )
                 if on_stream_created is not None:
+                    # SEP08_POOL_METADATA_CAPTURE: same ordering guarantee on
+                    # the managed-execution branch (fix cd4d8fd086).
                     run_callback(on_stream_created, raw_stream)
                 if (
                     completed_response_predicate is not None
