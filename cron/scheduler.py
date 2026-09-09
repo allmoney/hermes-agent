@@ -5901,10 +5901,18 @@ def run_job(
             or model
         )
         job["_resolved_provider"] = result.get("provider") or getattr(agent, "provider", None) or runtime.get("provider", "")
+        # SEP08_CRON_FOOTER_PRIMARY_URL_FIX: _primary_runtime_base_url is the
+        # job's PRIMARY route, not the upstream that actually produced the
+        # final response. When the primary 429s and the agent fails over to
+        # the pool, the primary domain must not be rendered as a "(pool)"
+        # provider in the cron footer (the 21:07 git-drift run footer showed
+        # "llm-pool-model · 🏁api.b.ai (pool)" for a pool-served response).
+        # Only response-path metadata (X-Pool-* capture, result.pool_base_url)
+        # may fill _resolved_pool_base_url; without it the footer renders the
+        # honest model/provider without a fabricated pool domain.
         job["_resolved_pool_base_url"] = (
             result.get("pool_base_url")
             or getattr(agent, "_pool_base_url", None)
-            or result.get("_primary_runtime_base_url")
         )
 
         # Emit one JSONL line per fire for usage audit.

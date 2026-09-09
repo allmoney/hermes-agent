@@ -2610,3 +2610,75 @@ class TestFailureStreakNudge:
         from cron.scheduler import _failure_streak_nudge
         with patch("cron.scheduler.load_config", side_effect=RuntimeError("boom")):
             assert "failed 3 runs" in _failure_streak_nudge(self._job(2))
+
+
+class TestCronFooterPoolAttribution:
+    """SEP08_CRON_FOOTER_PRIMARY_URL_FIX regression tests.
+
+    The cron footer must never attribute a pool-served response to the
+    job's PRIMARY route domain. Reproduces the 21:07 git-drift run footer
+    "llm-pool-model · 🏁api.b.ai (pool)" where the primary (b.ai) had
+    already failed with HTTP 429 and the final response was served by the
+    pool (X-Pool-* metadata), not by the primary.
+    """
+
+    @staticmethod
+    def _job_for_footer():
+        return {
+            "id": "footer-attrib",
+            "name": "footer-attrib",
+            "deliver": "origin",
+            "origin": {"platform": "telegram", "chat_id": "123"},
+            # Sep08 flow: per-job primary route resolved from snapshots.
+            "model_snapshot": "glm-5.3-flash",
+            "provider_snapshot": "custom",
+        }
+
+    def _deliver(self, job):
+        from gateway.config import Platform
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock:
+            _deliver_result(job, "run output")
+        sent = send_mock.call_args.kwargs.get("content") or send_mock.call_args[0][-1]
+        footer = sent.split("\n")[-1]
+        return sent, footer
+
+    def test_pool_metadata_renders_real_upstream(self):
+        job = self._job_for_footer()
+        job["_resolved_model"] = "openai/gpt-5.6-terra"
+        job["_resolved_provider"] = "custom:llm-pool"
+        job["_resolved_pool_base_url"] = "https://api.closerouter.dev/v1"
+        _, footer = self._deliver(job)
+        assert "gpt-5.6-terra" in footer
+        assert "api.closerouter.dev" in footer
+        assert "(pool)" in footer
+        assert "llm-pool-model" not in footer
+
+    def test_primary_route_url_is_not_rendered_as_pool(self):
+        # Failover case: agent mutated to the pool alias after the primary
+        # 429'd, but NO response-path pool metadata was captured. The primary
+        # route URL must NOT be rendered as a "(pool)" provider domain.
+        job = self._job_for_footer()
+        job["_resolved_model"] = "llm-pool-model"
+        job["_resolved_provider"] = "custom:llm-pool"
+        # Note: no _resolved_pool_base_url — the fix removed the
+        # _primary_runtime_base_url fallback that fabricated this line.
+        _, footer = self._deliver(job)
+        assert "api.b.ai" not in footer
+        assert "(pool)" not in footer
+        assert "unknown" not in footer
+
+    def test_missing_pool_metadata_keeps_model_and_marker(self):
+        job = self._job_for_footer()
+        job["_resolved_model"] = "llm-pool-model"
+        job["_resolved_provider"] = "custom:llm-pool"
+        job["_resolved_pool_base_url"] = "http://127.0.0.1:9120/v1"
+        _, footer = self._deliver(job)
+        # Honest fallback: pool marker with no fabricated upstream domain,
+        # model alias preserved as-is (never shown as a real model).
+        assert "llm-pool-model" in footer
+        assert "(pool)" in footer

@@ -6509,6 +6509,19 @@ class TurnRunner:
                 "output_tokens": _output_toks,
                 "model": _resolved_model,
                 "context_length": _context_length,
+                # SEP09B_FOOTER_POOL_PASSTHROUGH: empty/failed-response return
+                # dropped pool metadata that turn_finalizer set on the agent
+                # (agent._pool_model / agent._pool_base_url). The footer call
+                # site reads agent_result.get("pool_model"), so the footer
+                # rendered the pool placeholder on these returns too. Source
+                # of truth is the live agent instance — the same values
+                # AUG20_FOOTER_FALLBACK_PROVIDER uses for provider/base_url.
+                "pool_model": (
+                    getattr(_agent, "_pool_model", "") or ""
+                ) if _agent else "",
+                "pool_base_url": (
+                    getattr(_agent, "_pool_base_url", "") or ""
+                ) if _agent else "",
             }
 
         # Scan tool results for MEDIA:<path> tags that need to be delivered
@@ -6591,6 +6604,19 @@ class TurnRunner:
             "model": _resolved_model,
             "context_length": _context_length,
             "session_id": effective_session_id,
+            # SEP09B_FOOTER_POOL_PASSTHROUGH: this reconstructed dict dropped
+            # pool metadata — turn_finalizer puts "pool_model"/"pool_base_url"
+            # in its result, but run_sync() returned a NEW dict without those
+            # keys, so the footer call site (agent_result.get("pool_model"))
+            # always saw None → placeholder "llm-pool-model · 🏁custom:llm-pool
+            # (pool)" even though POOL_CAP_ST_OK proved capture worked. Source
+            # of truth: the live agent instance (same as AUG20 inject).
+            "pool_model": (
+                getattr(_agent, "_pool_model", "") or ""
+            ) if _agent else "",
+            "pool_base_url": (
+                getattr(_agent, "_pool_base_url", "") or ""
+            ) if _agent else "",
             "response_previewed": result.get("response_previewed", False),
             "response_transformed": result.get("response_transformed", False),
             # Pass through the agent_persisted flag so the persistence block
