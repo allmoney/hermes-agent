@@ -4001,6 +4001,15 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                     if _pool_base_url_header:
                         agent._pool_base_url = _pool_base_url_header
                     _got_headers = bool(_pool_model_header or _pool_base_url_header)
+                    if _got_headers:
+                        # SEP09_DIAG: compact success marker — proves the pool
+                        # headers were seen on the REAL runtime turn. One line
+                        # per streaming call that carries them.
+                        logger.info(
+                            "POOL_CAP_ST_OK model=%s base=%s",
+                            _pool_model_header or "-",
+                            _pool_base_url_header or "-",
+                        )
                 except Exception as _cap_exc:
                     logger.warning("POOL_CAP_ST_FAIL: %s", _cap_exc)
             # Phase jul05: removed loud POOL_CAP_ST info log (was debug-level data
@@ -4041,16 +4050,24 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             return True
 
         def _capture_stream_model(chunk: Any) -> None:
-            """Preserve the upstream model for the runtime footer (parity
-            with the non-streaming body-model fallback at ~line 1872): the
-            footer only consumes this when _is_pool_provider() matches."""
+            """Preserve the upstream model for the runtime footer.
+
+            The native OpenAI stream yields SDK objects, while the Relay
+            adapter yields JSON-able dictionaries after codec processing.
+            Support both shapes; otherwise Relay fallback turns silently
+            lose the concrete upstream model and the footer falls back to
+            ``llm-pool-model``.
+            """
             nonlocal model_name
-            _chunk_model = getattr(chunk, "model", None)
+            if isinstance(chunk, dict):
+                _chunk_model = chunk.get("model")
+            else:
+                _chunk_model = getattr(chunk, "model", None)
             if not _chunk_model:
                 return
-            model_name = _chunk_model
-            if _chunk_model != "llm-pool-model":
-                agent._pool_model = _chunk_model
+            model_name = str(_chunk_model)
+            if model_name != "llm-pool-model":
+                agent._pool_model = model_name
 
         def _relay_final_response() -> dict[str, Any]:
             tool_calls = [tool_calls_acc[index] for index in sorted(tool_calls_acc)]
