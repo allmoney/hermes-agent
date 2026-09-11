@@ -29479,8 +29479,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         and followup_result.get("completed") is True
                         and not followup_result.get("failed")
                     ):
-                        from gateway.queued_prompt_spool import ack
-                        ack(queue_id)
+                        # HANDOFF_PATCH_SEP11_QUEUE_ACK_AUDIT: completed alone
+                        # does not prove that this queued turn reached a model.
+                        from gateway.queued_prompt_spool import ack, queued_turn_succeeded
+                        if queued_turn_succeeded(followup_result):
+                            ack(queue_id)
                 return _preserve_queued_followup_history_offset(result, followup_result)
         finally:
             # Stop progress sender, interrupt monitor, and notification task
@@ -30830,9 +30833,13 @@ def main():
     # _advertise_agent_env in hermes_cli/main.py, kept inline here to avoid
     # importing that module's startup side effects). The value must equal our
     # public agent-harness registry id (``hermes-agent``) — standard-var
-    # matching is exact. setdefault so an outer harness is never clobbered.
-    os.environ.setdefault("AI_AGENT", "hermes-agent")
-    os.environ.setdefault("HERMES_AGENT", "true")
+    # matching is exact. Only filled when unset/empty so an outer harness is
+    # never clobbered — and an empty inherited value cannot shadow the default
+    # (os.environ.setdefault would keep the empty string; 2026-09-11 lesson).
+    if not os.environ.get("AI_AGENT"):
+        os.environ["AI_AGENT"] = "hermes-agent"
+    if not os.environ.get("HERMES_AGENT"):
+        os.environ["HERMES_AGENT"] = "true"
 
     # Force UTF-8 stdio on Windows — gateway logs and startup banner would
     # otherwise UnicodeEncodeError on cp1252 consoles.  No-op on POSIX.

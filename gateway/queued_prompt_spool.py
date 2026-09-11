@@ -28,15 +28,19 @@ aug28 durability fix (queue task #7, /reset + /new):
 """
 from __future__ import annotations
 
+# HANDOFF_PATCH_SEP11_QUEUE_ACK_AUDIT
 import json
+import logging
 import os
 import tempfile
 import threading
+import time
 import uuid
 from pathlib import Path
 from typing import Any
 
 _LOCK = threading.RLock()
+_LOG = logging.getLogger(__name__)
 # Process-local: set of queue_ids that have already been injected into a live
 # adapter during THIS gateway process.  Cleared on restart, so a crashed run
 # is re-injected on the next startup (at-least-once delivery).  The set only
@@ -54,6 +58,48 @@ def _path() -> Path:
     except OSError:
         pass
     return p
+
+
+def _audit_path() -> Path:
+    return _path().with_name("queued_prompts.audit.jsonl")
+
+
+def _audit(event: str, item_id: str | None = None, **fields: Any) -> None:
+    """Append lifecycle evidence without copying queued message content."""
+    record: dict[str, Any] = {
+        "ts": time.time(),
+        "event": event,
+    }
+    if item_id:
+        record["id"] = str(item_id)
+    record.update(fields)
+    path = _audit_path()
+    try:
+        fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", dir=str(path.parent))
+    except OSError as exc:
+        # Audit evidence is best-effort: a disk problem must never break the
+        # queue surface itself (enqueue/ack/clear), only its observability.
+        _LOG.warning("queue audit write unavailable (%s): %s", event, exc)
+        return
+    try:
+        # Rewrite-and-replace keeps the evidence file valid after a crash.
+        prior = path.read_text(encoding="utf-8") if path.exists() else ""
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(prior)
+            f.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    except OSError as exc:
+        _LOG.warning("queue audit write failed (%s): %s", event, exc)
+    finally:
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
 
 
 def _read() -> list[dict[str, Any]]:
@@ -105,6 +151,7 @@ def enqueue(*, session_key: str, text: str, source: dict[str, Any],
                           "text": text, "source": safe_source,
                           "metadata": safe_metadata})
             _write(items)
+            _audit("enqueued", item_id, session_key=session_key)
         return item_id
 
 
@@ -114,6 +161,20 @@ def ack(item_id: str | None) -> None:
     with _LOCK:
         items = [x for x in _read() if str(x.get("id")) != str(item_id)]
         _write(items)
+        _audit("acknowledged", item_id)
+
+
+def queued_turn_succeeded(result: Any) -> bool:
+    """Return true only when the queued turn reached a real model response."""
+    if not isinstance(result, dict):
+        return False
+    reason = str(result.get("turn_exit_reason") or "")
+    return (
+        result.get("completed") is True
+        and not result.get("failed")
+        and reason != "compaction_handoff_not_actionable"
+        and not reason.startswith("max_iterations_reached(")
+    )
 
 
 def clear_session(session_key: str) -> None:
@@ -121,8 +182,12 @@ def clear_session(session_key: str) -> None:
     if not session_key:
         return
     with _LOCK:
-        items = [x for x in _read() if x.get("session_key") != session_key]
+        current = _read()
+        items = [x for x in current if x.get("session_key") != session_key]
         _write(items)
+        for item in current:
+            if item.get("session_key") == session_key:
+                _audit("cleared", str(item.get("id")), session_key=session_key)
 
 
 def pending() -> list[dict[str, Any]]:

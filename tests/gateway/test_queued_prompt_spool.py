@@ -38,3 +38,30 @@ def test_queue_ledger_restores_fifo_and_acks(tmp_path, monkeypatch):
     assert [item["id"] for item in spool.pending()] == [q2]
     spool.clear_session("agent:main:telegram:dm:210540672")
     assert spool.pending() == []
+
+
+def test_queue_ack_requires_real_turn_completion():
+    assert not spool.queued_turn_succeeded({
+        "completed": True, "failed": False,
+        "turn_exit_reason": "compaction_handoff_not_actionable",
+    })
+    assert not spool.queued_turn_succeeded({
+        "completed": True, "failed": False,
+        "turn_exit_reason": "max_iterations_reached(10/10)",
+    })
+    assert spool.queued_turn_succeeded({
+        "completed": True, "failed": False,
+        "turn_exit_reason": "text_response(finish_reason=stop)",
+    })
+
+
+def test_queue_lifecycle_audit_excludes_message_text(tmp_path, monkeypatch):
+    monkeypatch.setattr(spool, "_path", lambda: tmp_path / "queued_prompts.json")
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="210540672")
+    item_id = spool.enqueue(session_key="session", text="secret user text",
+                            source=source.to_dict())
+    spool.ack(item_id)
+    audit = (tmp_path / "queued_prompts.audit.jsonl").read_text()
+    assert '"event":"enqueued"' in audit
+    assert '"event":"acknowledged"' in audit
+    assert "secret user text" not in audit
