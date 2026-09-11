@@ -29,6 +29,7 @@ aug28 durability fix (queue task #7, /reset + /new):
 from __future__ import annotations
 
 # HANDOFF_PATCH_SEP11_QUEUE_ACK_AUDIT
+# HANDOFF_PATCH_SEP11_QUEUE_REPLY_ANCHOR
 import json
 import logging
 import os
@@ -218,8 +219,15 @@ def restore_into_runner(runner: Any) -> int:
                 continue
             metadata = dict(item.get("metadata") or {})
             metadata["queue_id"] = str(item["id"])
+            # HANDOFF_PATCH_SEP11_QUEUE_REPLY_ANCHOR: the spool keeps the
+            # original platform message id inside source.message_id, but the
+            # restored event used to lose it — so a queued turn answered after
+            # a gateway restart replied without the native reply anchor and
+            # the user could not jump to their task message. Restore it so
+            # delivery replies to the user's original task message again.
             event = MessageEvent(text=str(item.get("text") or ""),
-                                 source=source, metadata=metadata)
+                                 source=source, metadata=metadata,
+                                 message_id=getattr(source, "message_id", None))
             runner._enqueue_fifo(item["session_key"], event, adapter)
             restored += 1
         except Exception:

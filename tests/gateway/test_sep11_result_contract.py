@@ -130,6 +130,41 @@ def test_run_sync_result_passthrough_preserves_turn_exit_reason():
     assert "queued_turn_succeeded(followup_result)" in src
 
 
+def test_restore_preserves_original_message_id_for_reply_anchor(tmp_path, monkeypatch):
+    """Restart recovery must keep Telegram's clickable task-message anchor."""
+    monkeypatch.setattr(spool, "_path", lambda: tmp_path / "queued_prompts.json")
+    monkeypatch.setattr(spool, "_audit_path", lambda: tmp_path / "queued_prompts.audit.jsonl")
+    item_id = spool.enqueue(
+        session_key="agent:main:telegram:dm:210540672",
+        text="task from Telegram",
+        source={
+            "platform": "telegram",
+            "chat_id": "210540672",
+            "chat_type": "dm",
+            "message_id": "123456",
+        },
+    )
+
+    class Adapter:
+        _pending_messages = {}
+
+    class Runner:
+        def __init__(self):
+            self.event = None
+
+        def _adapter_for_source(self, source):
+            return Adapter()
+
+        def _enqueue_fifo(self, session_key, event, adapter):
+            self.event = event
+
+    runner = Runner()
+    assert spool.restore_into_runner(runner) == 1
+    assert runner.event.message_id == "123456"
+    assert runner.event.source.message_id == "123456"
+    assert runner.event.metadata["queue_id"] == item_id
+
+
 def test_live_spool_state_not_corrupted_by_this_contract():
     # sanity: current live spool parses; audit file readable; no content leak
     live = json.loads(Path("/root/.hermes/queued_prompts.json").read_text())
