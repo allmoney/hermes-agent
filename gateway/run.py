@@ -6580,6 +6580,11 @@ class TurnRunner:
                 ctx.result_holder[0].get("failure_reason") if ctx.result_holder[0] else None
             ),
             "completed": ctx.result_holder[0].get("completed") if ctx.result_holder[0] else None,
+            # HANDOFF_PATCH_SEP11_RESULT_CONTRACT: queue acknowledgement is allowed only for a normal terminal
+            # model response. Preserve the finalizer provenance for that gate.
+            "turn_exit_reason": (
+                ctx.result_holder[0].get("turn_exit_reason") if ctx.result_holder[0] else None
+            ),
             "interrupted": ctx.result_holder[0].get("interrupted", False) if ctx.result_holder[0] else False,
             "partial": ctx.result_holder[0].get("partial", False) if ctx.result_holder[0] else False,
             "error": ctx.result_holder[0].get("error") if ctx.result_holder[0] else None,

@@ -51,6 +51,8 @@ def test_queue_ack_requires_real_turn_completion():
     })
     assert spool.queued_turn_succeeded({
         "completed": True, "failed": False,
+        "final_response": "Real model answer delivered to the user.",
+        "interrupted": False, "partial": False,
         "turn_exit_reason": "text_response(finish_reason=stop)",
     })
 

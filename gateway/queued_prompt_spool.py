@@ -164,16 +164,26 @@ def ack(item_id: str | None) -> None:
         _audit("acknowledged", item_id)
 
 
+# HANDOFF_PATCH_SEP11_RESULT_CONTRACT: narrow queue-ack success predicate
 def queued_turn_succeeded(result: Any) -> bool:
-    """Return true only when the queued turn reached a real model response."""
+    """Return true only when a queued turn produced a real final result.
+
+    ``completed=True`` is not sufficient: finalization can produce synthetic
+    fallback text after provider failures, exhaustion, interruption, or
+    compaction.  The normal text-response exit is the narrow success contract
+    for durable queue acknowledgement.
+    """
     if not isinstance(result, dict):
         return False
     reason = str(result.get("turn_exit_reason") or "")
+    final_response = result.get("final_response")
     return (
         result.get("completed") is True
         and not result.get("failed")
-        and reason != "compaction_handoff_not_actionable"
-        and not reason.startswith("max_iterations_reached(")
+        and result.get("interrupted") is not True
+        and result.get("partial") is not True
+        and bool(final_response and str(final_response).strip())
+        and reason.startswith("text_response(")
     )
 
 
