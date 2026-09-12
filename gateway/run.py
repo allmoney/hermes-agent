@@ -8909,6 +8909,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         else:
             pending_slot[session_key] = queued_event
 
+    def _retain_queued_event_after_abort(
+        self,
+        session_key: str,
+        adapter: Any,
+        event: "MessageEvent",
+    ) -> None:
+        """Restore an extracted queue event after cancellation/exception."""
+        if adapter is None or not hasattr(adapter, "_pending_messages"):
+            return
+        slot = adapter._pending_messages
+        displaced = slot.get(session_key)
+        if displaced is event:
+            return
+        if displaced is not None:
+            self._session_state(session_key).conversation.queued_events.insert(0, displaced)
+        slot[session_key] = event
+        logger.warning(
+            "Retained queued event for %s after interrupted follow-up",
+            session_key or "?",
+        )
+
     async def _requeue_provider_failed_event(
         self,
         session_key: str,
@@ -29524,19 +29545,33 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # what the follow-up's guard will consult.  Fail-safe in helper.
                 await self._refresh_agent_cache_message_count(session_key, session_id)
 
-                followup_result = await self._run_agent(
-                    message=next_message,
-                    context_prompt=context_prompt,
-                    history=updated_history,
-                    source=next_source,
-                    session_id=session_id,
-                    session_key=next_session_key,
-                    run_generation=run_generation,
-                    _interrupt_depth=_interrupt_depth + 1,
-                    event_message_id=next_message_id,
-                    channel_prompt=next_channel_prompt,
-                    message_type=next_message_type,
-                )
+                try:
+                    followup_result = await self._run_agent(
+                        message=next_message,
+                        context_prompt=context_prompt,
+                        history=updated_history,
+                        source=next_source,
+                        session_id=session_id,
+                        session_key=next_session_key,
+                        run_generation=run_generation,
+                        _interrupt_depth=_interrupt_depth + 1,
+                        event_message_id=next_message_id,
+                        channel_prompt=next_channel_prompt,
+                        message_type=next_message_type,
+                    )
+                except BaseException:
+                    # The durable item is deliberately not acked until the
+                    # recursive turn returns a real delivered result.  If the
+                    # turn is cancelled or raises before returning, restore it
+                    # to the live FIFO immediately as well; otherwise it would
+                    # remain only on disk until a restart.
+                    if pending_event is not None:
+                        self._retain_queued_event_after_abort(
+                            next_session_key,
+                            self._adapter_for_source(next_source),
+                            pending_event,
+                        )
+                    raise
                 if pending_event is not None:
                     queue_id = (getattr(pending_event, "metadata", None) or {}).get("queue_id")
                     if queue_id and isinstance(followup_result, dict):
