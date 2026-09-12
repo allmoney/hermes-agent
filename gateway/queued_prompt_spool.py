@@ -219,6 +219,11 @@ def restore_into_runner(runner: Any) -> int:
                 continue
             metadata = dict(item.get("metadata") or {})
             metadata["queue_id"] = str(item["id"])
+            # Restore the original task message id explicitly. SessionSource
+            # does not reliably retain Telegram's message_id after restart.
+            restored_reply_anchor = metadata.get("queue_reply_anchor")
+            if restored_reply_anchor is None:
+                restored_reply_anchor = getattr(source, "message_id", None)
             # HANDOFF_PATCH_SEP11_QUEUE_REPLY_ANCHOR: the spool keeps the
             # original platform message id inside source.message_id, but the
             # restored event used to lose it — so a queued turn answered after
@@ -227,7 +232,7 @@ def restore_into_runner(runner: Any) -> int:
             # delivery replies to the user's original task message again.
             event = MessageEvent(text=str(item.get("text") or ""),
                                  source=source, metadata=metadata,
-                                 message_id=getattr(source, "message_id", None))
+                                 message_id=str(restored_reply_anchor) if restored_reply_anchor is not None else None)
             runner._enqueue_fifo(item["session_key"], event, adapter)
             restored += 1
         except Exception:

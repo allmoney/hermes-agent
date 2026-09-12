@@ -6522,6 +6522,9 @@ class TurnRunner:
                 "pool_base_url": (
                     getattr(_agent, "_pool_base_url", "") or ""
                 ) if _agent else "",
+                "pool_key_id": (
+                    getattr(_agent, "_pool_key_id", "") or ""
+                ) if _agent else "",
             }
 
         # Scan tool results for MEDIA:<path> tags that need to be delivered
@@ -6621,6 +6624,9 @@ class TurnRunner:
             ) if _agent else "",
             "pool_base_url": (
                 getattr(_agent, "_pool_base_url", "") or ""
+            ) if _agent else "",
+            "pool_key_id": (
+                getattr(_agent, "_pool_key_id", "") or ""
             ) if _agent else "",
             "response_previewed": result.get("response_previewed", False),
             "response_transformed": result.get("response_transformed", False),
@@ -8874,7 +8880,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # in metadata so a restart restores the same item without duplication.
         try:
             from gateway.queued_prompt_spool import enqueue
-            _meta = getattr(queued_event, "metadata", None) or {}
+            _meta = dict(getattr(queued_event, "metadata", None) or {})
+            # Persist the inbound task message id separately from SessionSource.
+            # SessionSource is routing state and does not reliably carry the
+            # Telegram update's message_id across durable restore.
+            _reply_anchor = self._reply_anchor_for_event(queued_event)
+            if _reply_anchor is not None:
+                _meta["queue_reply_anchor"] = str(_reply_anchor)
             _qid = enqueue(
                 session_key=session_key,
                 text=getattr(queued_event, "text", "") or "",
@@ -8882,6 +8894,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 metadata=_meta,
             )
             queued_event.metadata["queue_id"] = _qid
+            if _reply_anchor is not None:
+                queued_event.metadata["queue_reply_anchor"] = str(_reply_anchor)
         except Exception:
             logger.exception("Failed to persist /queue item for %s", session_key)
             return
@@ -20316,6 +20330,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # instead of the real upstream model + provider domain.
                     pool_model=agent_result.get("pool_model"),
                     pool_base_url=agent_result.get("pool_base_url"),
+                    pool_key_id=agent_result.get("pool_key_id"),
                 )
             except Exception as _footer_err:
                 logger.debug("runtime_footer build failed: %s", _footer_err)
@@ -22225,12 +22240,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         deliver_media: bool = True,
     ) -> None:
         """Deliver a queued response using the normal text+attachment split."""
+        # HANDOFF_PATCH_SEP12_QUEUE_DELAYED_REPLY: queued/delayed first responses
+        # must retain the original Telegram task-message anchor.
+        reply_to_message_id = event_message_id or getattr(source, "message_id", None)
         if not text_already_delivered:
             text_content = _strip_response_attachments_for_direct_send(response, adapter)
             if text_content:
                 await adapter.send(
                     source.chat_id,
                     text_content,
+                    reply_to=reply_to_message_id,
                     metadata=metadata,
                 )
 
