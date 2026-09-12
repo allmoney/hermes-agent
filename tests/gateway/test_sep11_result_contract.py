@@ -36,6 +36,11 @@ def test_sanitized_provider_error_with_text_response_must_not_ack():
     assert spool.queued_turn_succeeded(result) is False
 
 
+def test_sanitized_provider_error_is_retryable():
+    result = _ok_text_response("Provider error:\n\nHTTP 502: All keys exhausted")
+    assert spool.queued_turn_should_retry(result) is True
+
+
 def test_provider_error_still_completed_must_not_ack():
     # The sep11 incident shape: no keys in pool -> retries exhausted ->
     # loop exited without a model response, final_response synthesized.

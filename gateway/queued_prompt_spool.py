@@ -174,6 +174,13 @@ _PROVIDER_ERROR_FINAL_RE = re.compile(
 )
 
 
+def queued_turn_should_retry(result: Any) -> bool:
+    """Whether a queued result is a sanitized transient provider failure."""
+    if not isinstance(result, dict):
+        return False
+    return bool(_PROVIDER_ERROR_FINAL_RE.match(str(result.get("final_response") or "").strip()))
+
+
 def queued_turn_succeeded(result: Any) -> bool:
     """Return true only when a queued turn produced a real final result.
 
@@ -194,7 +201,7 @@ def queued_turn_succeeded(result: Any) -> bool:
         and result.get("interrupted") is not True
         and result.get("partial") is not True
         and bool(response_text)
-        and not _PROVIDER_ERROR_FINAL_RE.match(response_text)
+        and not queued_turn_should_retry(result)
         and reason.startswith("text_response(")
     )
 

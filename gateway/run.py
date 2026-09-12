@@ -8909,6 +8909,37 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         else:
             pending_slot[session_key] = queued_event
 
+    async def _requeue_provider_failed_event(
+        self,
+        session_key: str,
+        adapter: Any,
+        event: "MessageEvent",
+    ) -> bool:
+        """Put a transiently failed /queue task back at FIFO head with backoff.
+
+        A provider-error envelope is delivered for transparency, but is not task
+        completion. Keep the same durable queue id and reply anchor, retry via
+        the normal next-turn drain, and never let later tasks overtake it.
+        """
+        metadata = getattr(event, "metadata", None) or {}
+        attempts = int(metadata.get("queue_provider_retry_attempt", 0))
+        if attempts >= 3 or adapter is None or not hasattr(adapter, "_pending_messages"):
+            return False
+        metadata["queue_provider_retry_attempt"] = attempts + 1
+        event.metadata = metadata
+        await asyncio.sleep(5 * (2 ** attempts))
+        slot = adapter._pending_messages
+        displaced = slot.get(session_key)
+        if displaced is not None and displaced is not event:
+            state = self._session_state(session_key)
+            state.conversation.queued_events.insert(0, displaced)
+        slot[session_key] = event
+        logger.warning(
+            "Queued provider failure for %s: retry %d/3 scheduled after backoff",
+            session_key or "?", attempts + 1,
+        )
+        return True
+
     def _promote_queued_event(
         self,
         session_key: str,
@@ -29505,9 +29536,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     ):
                         # HANDOFF_PATCH_SEP11_QUEUE_ACK_AUDIT: completed alone
                         # does not prove that this queued turn reached a model.
-                        from gateway.queued_prompt_spool import ack, queued_turn_succeeded
+                        from gateway.queued_prompt_spool import (
+                            ack,
+                            queued_turn_should_retry,
+                            queued_turn_succeeded,
+                        )
                         if queued_turn_succeeded(followup_result):
                             ack(queue_id)
+                        elif queued_turn_should_retry(followup_result):
+                            await self._requeue_provider_failed_event(
+                                next_session_key,
+                                self._adapter_for_source(next_source),
+                                pending_event,
+                            )
                 return _preserve_queued_followup_history_offset(result, followup_result)
         finally:
             # Stop progress sender, interrupt monitor, and notification task
