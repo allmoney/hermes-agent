@@ -8930,6 +8930,92 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             session_key or "?",
         )
 
+    # HANDOFF_PATCH_SEP12_QUEUE_STARTUP_DRAIN: durable /q items restored at
+    # boot sit in the adapter slot but nothing triggers the recursive drain
+    # until a new inbound message arrives — so the backlog stalls silently
+    # ("почему остановился?"). After the startup gate opens, dispatch the
+    # restored head once per session as a synthetic turn; the existing
+    # recursive drain chains the rest of the FIFO. The event remains durable
+    # until the narrow success ack, so a failed synthetic turn is safe to
+    # retry on the next turn/restart.
+    async def _drain_restored_durable_queue_items(self) -> int:
+        """Dispatch restored durable /q heads so the backlog drains itself."""
+        drained = 0
+        for adapter in (getattr(self, "adapters", {}) or {}).values():
+            slot = getattr(adapter, "_pending_messages", None)
+            if not isinstance(slot, dict):
+                continue
+            for session_key in list(slot.keys()):
+                event = slot.get(session_key)
+                meta = getattr(event, "metadata", None) or {}
+                if not meta.get("queue_id"):
+                    continue
+                slot.pop(session_key, None)
+                try:
+                    setattr(event, "_hermes_startup_restore_replay", True)
+                except Exception:
+                    pass
+                try:
+                    await adapter.handle_message(event)
+                    session_tasks = getattr(adapter, "_session_tasks", {})
+                    task = (
+                        session_tasks.get(session_key)
+                        if isinstance(session_tasks, dict)
+                        else None
+                    )
+                    if task is not None:
+                        await asyncio.shield(task)
+                        # handle_message's task result is the completed agent
+                        # envelope; settle the top-level restored item using
+                        # the same contract as recursive queue draining.
+                        await self._settle_direct_queued_event(
+                            session_key, adapter, event, task.result()
+                        )
+                except Exception:
+                    logger.exception(
+                        "Failed to dispatch restored durable queue item for %s",
+                        session_key or "?",
+                    )
+                    self._retain_queued_event_after_abort(session_key, adapter, event)
+                    continue
+                drained += 1
+        if drained:
+            logger.info("Dispatched %d restored durable /queue task(s)", drained)
+        return drained
+
+    async def _settle_direct_queued_event(
+        self,
+        session_key: str,
+        adapter: Any,
+        event: "MessageEvent",
+        result: Any,
+    ) -> None:
+        """Settle a restored /q item dispatched as a top-level turn.
+
+        Normal queue draining settles the dequeued item in the recursive
+        ``_run_agent`` branch. Startup dispatch enters through
+        ``_handle_message`` instead, so it must use the same narrow contract
+        here or it would run repeatedly without ever acknowledging success.
+        """
+        metadata = getattr(event, "metadata", None) or {}
+        queue_id = metadata.get("queue_id")
+        if not queue_id:
+            return
+        if not isinstance(result, dict):
+            self._retain_queued_event_after_abort(session_key, adapter, event)
+            return
+        from gateway.queued_prompt_spool import (
+            ack,
+            queued_turn_should_retry,
+            queued_turn_succeeded,
+        )
+        if queued_turn_should_retry(result):
+            await self._requeue_provider_failed_event(session_key, adapter, event)
+        elif queued_turn_succeeded(result):
+            ack(queue_id)
+        else:
+            self._retain_queued_event_after_abort(session_key, adapter, event)
+
     async def _requeue_provider_failed_event(
         self,
         session_key: str,
@@ -11981,6 +12067,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         exc_info=(type(exc), exc, exc.__traceback__),
                     )
         self._startup_restore_tasks = []
+        # Durable /q entries are already restored into adapter slots at boot,
+        # but no inbound event exists to trigger the normal recursive drain.
+        # Start one synthetic drain per affected session after the startup gate
+        # opens; the item remains durable until the narrow success ack.
+        await self._drain_restored_durable_queue_items()
         drained = await self._drain_startup_restore_queue()
         self._startup_restore_in_progress = False
         if drained:
@@ -16361,6 +16452,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             self._enqueue_fifo(quick_key, queued_event, adapter)
         depth = self._queue_depth(quick_key, adapter=self._adapter_for_source(source))
+        # The durable spool is the source of truth for the count. Live FIFO
+        # slots/overflow are projections of the same items and must not be
+        # added again (after restore that used to inflate 2 items to 10).
+        try:
+            from gateway.queued_prompt_spool import pending as _pending_queue
+            durable_ids = {
+                str(item.get("id")) for item in _pending_queue()
+                if item.get("session_key") == quick_key
+            }
+            depth = len(durable_ids)
+        except Exception:
+            pass
         if depth <= 1:
             return "Queued for the next turn."
         return f"Queued for the next turn. ({depth} queued)"
@@ -17996,6 +18099,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "protect the transcript, this message was not processed. "
                     "Wait for the active turn to finish, then resend it."
                 )
+            except BaseException:
+                # A /queue item is removed from the adapter's next-up slot
+                # before entering this handler. Any exception before the
+                # recursive drain reaches its own requeue branch (including
+                # startup recovery/session setup failures) must put that exact
+                # durable event back, otherwise the ledger waits idle until a
+                # later restart despite pending work.
+                _queued_meta = getattr(event, "metadata", None) or {}
+                if _queued_meta.get("queue_id"):
+                    self._retain_queued_event_after_abort(
+                        _quick_key,
+                        self._adapter_for_source(source),
+                        event,
+                    )
+                raise
             try:
                 await self._run_post_turn_hooks(
                     agent_result=_agent_result,

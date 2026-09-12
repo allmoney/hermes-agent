@@ -195,3 +195,15 @@ def test_live_spool_state_not_corrupted_by_this_contract():
     assert isinstance(live, list)
     for item in live:
         assert {"id", "session_key", "text"} <= set(item.keys())
+
+
+def test_outer_handler_retains_durable_queue_event_before_recursive_drain():
+    """Any pre-drain exception must restore a queue item to the live FIFO."""
+    src = (REPO / "gateway" / "run.py").read_text()
+    marker = "except TurnLeaseTimeoutError as exc:"
+    start = src.index(marker)
+    end = src.index("    def _restore_moa_one_shot", start)
+    block = src[start:end]
+    assert "except BaseException:" in block
+    assert "_retain_queued_event_after_abort(" in block
+    assert '_queued_meta.get("queue_id")' in block
