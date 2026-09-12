@@ -149,6 +149,15 @@ def enqueue(*, session_key: str, text: str, source: dict[str, Any],
             # best-effort durability feature to break the live FIFO queue.
             safe_source = json.loads(json.dumps(source, default=str))
             safe_metadata = json.loads(json.dumps(metadata or {}, default=str))
+            # Bind every durable Telegram task to its own source message at
+            # enqueue time.  Session-level delivery state is not an anchor and
+            # may belong to a neighbouring FIFO item.
+            if (
+                safe_metadata.get("queue_reply_anchor") is None
+                and str(safe_source.get("platform") or "").lower() == "telegram"
+                and safe_source.get("message_id") is not None
+            ):
+                safe_metadata["queue_reply_anchor"] = str(safe_source["message_id"])
             items.append({"id": item_id, "session_key": session_key,
                           "text": text, "source": safe_source,
                           "metadata": safe_metadata})
@@ -222,6 +231,29 @@ def clear_session(session_key: str) -> None:
 def pending() -> list[dict[str, Any]]:
     with _LOCK:
         return _read()
+
+
+def backfill_reply_anchors() -> int:
+    """Repair legacy durable Telegram items written before anchor persistence."""
+    changed = 0
+    with _LOCK:
+        items = _read()
+        for item in items:
+            source = item.get("source") or {}
+            metadata = item.setdefault("metadata", {})
+            if (
+                isinstance(source, dict)
+                and isinstance(metadata, dict)
+                and metadata.get("queue_reply_anchor") is None
+                and str(source.get("platform") or "").lower() == "telegram"
+                and source.get("message_id") is not None
+            ):
+                metadata["queue_reply_anchor"] = str(source["message_id"])
+                changed += 1
+        if changed:
+            _write(items)
+            _audit("reply_anchors_backfilled", count=changed)
+    return changed
 
 
 def restore_into_runner(runner: Any) -> int:
