@@ -8923,8 +8923,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         metadata = getattr(event, "metadata", None) or {}
         attempts = int(metadata.get("queue_provider_retry_attempt", 0))
-        if attempts >= 3 or adapter is None or not hasattr(adapter, "_pending_messages"):
+        if adapter is None or not hasattr(adapter, "_pending_messages"):
             return False
+        if attempts >= 3:
+            slot = adapter._pending_messages
+            displaced = slot.get(session_key)
+            if displaced is not None and displaced is not event:
+                self._session_state(session_key).conversation.queued_events.insert(0, displaced)
+            slot[session_key] = event
+            logger.error(
+                "Queued provider failure for %s reached retry limit; keeping task pending",
+                session_key or "?",
+            )
+            return True
         metadata["queue_provider_retry_attempt"] = attempts + 1
         event.metadata = metadata
         await asyncio.sleep(5 * (2 ** attempts))
