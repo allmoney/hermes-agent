@@ -40,6 +40,32 @@ def test_queue_ledger_restores_fifo_and_acks(tmp_path, monkeypatch):
     assert spool.pending() == []
 
 
+def test_each_telegram_item_persists_its_own_reply_anchor(tmp_path, monkeypatch):
+    monkeypatch.setattr(spool, "_path", lambda: tmp_path / "queued_prompts.json")
+    session_key = "agent:main:telegram:dm:210540672"
+    first = spool.enqueue(
+        session_key=session_key,
+        text="first",
+        source={"platform": "telegram", "chat_id": "210540672", "message_id": "111"},
+    )
+    second = spool.enqueue(
+        session_key=session_key,
+        text="second",
+        source={"platform": "telegram", "chat_id": "210540672", "message_id": "222"},
+    )
+    by_id = {item["id"]: item for item in spool.pending()}
+    assert by_id[first]["metadata"]["queue_reply_anchor"] == "111"
+    assert by_id[second]["metadata"]["queue_reply_anchor"] == "222"
+
+    # Legacy entries without metadata are repaired from their own source, not
+    # from session-level delivery state or a neighbouring FIFO item.
+    by_id[second]["metadata"].pop("queue_reply_anchor")
+    spool._write(list(by_id.values()))
+    assert spool.backfill_reply_anchors() == 1
+    by_id = {item["id"]: item for item in spool.pending()}
+    assert by_id[second]["metadata"]["queue_reply_anchor"] == "222"
+
+
 def test_queue_ack_requires_real_turn_completion():
     assert not spool.queued_turn_succeeded({
         "completed": True, "failed": False,
