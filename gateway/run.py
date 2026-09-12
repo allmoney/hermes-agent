@@ -22304,8 +22304,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     ) -> None:
         """Deliver a queued response using the normal text+attachment split."""
         # HANDOFF_PATCH_SEP12_QUEUE_DELAYED_REPLY: queued/delayed first responses
-        # must retain the original Telegram task-message anchor.
-        reply_to_message_id = event_message_id or getattr(source, "message_id", None)
+        # must retain the original Telegram task-message anchor. Prefer the
+        # anchor persisted with THIS queue item: event_message_id can be a
+        # stale/session-level fallback on mixed delayed/recovery paths.
+        _queued_metadata = metadata or {}
+        reply_to_message_id = (
+            _queued_metadata.get("queue_reply_anchor")
+            or event_message_id
+            or getattr(source, "message_id", None)
+        )
         if not text_already_delivered:
             text_content = _strip_response_attachments_for_direct_send(response, adapter)
             if text_content:
