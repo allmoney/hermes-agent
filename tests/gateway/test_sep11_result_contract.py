@@ -243,6 +243,16 @@ def test_queued_delivery_args_use_item_anchor_not_outer_anchor():
     assert metadata.get("telegram_reply_to_message_id") != "outer"
 
 
+def test_queued_streaming_uses_durable_item_anchor():
+    src = (REPO / "gateway" / "run.py").read_text()
+    marker = "_queued_item_metadata = getattr(pending_event, \"metadata\", None) or {}"
+    start = src.index(marker)
+    block = src[start:start + 900]
+    assert 'get("queue_reply_anchor")' in block
+    assert "or self._reply_anchor_for_event(pending_event)" in block
+    assert "event_message_id=next_message_id" in src[start:]
+
+
 def test_queued_delivery_args_cannot_be_overwritten_by_legacy_item_route():
     runner = object.__new__(GatewayRunner)
     source = SessionSource.from_dict({

@@ -29700,7 +29700,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
                     if next_message is None:
                         return result
-                    next_message_id = self._reply_anchor_for_event(pending_event)
+                    # The recursive turn can stream its final response directly,
+                    # bypassing _deliver_queued_first_response.  Use the durable
+                    # item's anchor here too: _reply_anchor_for_event() only sees
+                    # the transient event and can be stale on legacy/restored
+                    # queue records.
+                    _queued_item_metadata = getattr(pending_event, "metadata", None) or {}
+                    next_message_id = (
+                        _queued_item_metadata.get("queue_reply_anchor")
+                        or self._reply_anchor_for_event(pending_event)
+                    )
                     next_channel_prompt = getattr(pending_event, "channel_prompt", None)
                     next_message_type = getattr(pending_event, "message_type", None)
 
