@@ -16,6 +16,9 @@ REPO = Path("/usr/local/lib/hermes-agent")
 sys.path.insert(0, str(REPO))
 
 from gateway import queued_prompt_spool as spool  # noqa: E402
+from gateway.run import GatewayRunner  # noqa: E402
+from gateway.platforms.base import MessageEvent  # noqa: E402
+from gateway.session import SessionSource  # noqa: E402
 
 
 def _ok_text_response(text="Done — report attached."):
@@ -189,7 +192,85 @@ def test_restore_preserves_original_message_id_for_reply_anchor(tmp_path, monkey
     assert runner.event.metadata["queue_id"] == item_id
 
 
-def test_live_spool_state_not_corrupted_by_this_contract():
+def test_restore_is_idempotent_and_does_not_duplicate_live_projection(tmp_path, monkeypatch):
+    """Repeated restore must not turn two durable items into four live ones."""
+    monkeypatch.setattr(spool, "_path", lambda: tmp_path / "queued_prompts.json")
+    monkeypatch.setattr(spool, "_audit_path", lambda: tmp_path / "queued_prompts.audit.jsonl")
+    for n in (1, 2):
+        spool.enqueue(
+            session_key="agent:main:telegram:dm:210540672",
+            text=f"task {n}",
+            source={"platform": "telegram", "chat_id": "210540672", "message_id": str(n)},
+        )
+
+    class Adapter:
+        _pending_messages = {}
+
+    class Runner:
+        def __init__(self):
+            self.events = []
+
+        def _adapter_for_source(self, source):
+            return Adapter()
+
+        def _enqueue_fifo(self, session_key, event, adapter):
+            self.events.append(event)
+
+    runner = Runner()
+    assert spool.restore_into_runner(runner) == 2
+    assert spool.restore_into_runner(runner) == 0
+    assert len(runner.events) == 2
+
+
+def test_queued_delivery_args_use_item_anchor_not_outer_anchor():
+    runner = object.__new__(GatewayRunner)
+    source = SessionSource.from_dict({
+        "platform": "telegram", "chat_id": "210540672", "message_id": "outer",
+    })
+    queued_source = SessionSource.from_dict({
+        "platform": "telegram", "chat_id": "210540672", "message_id": "item",
+    })
+    event = MessageEvent(
+        text="queued task", source=queued_source, message_id="item",
+        metadata={"queue_id": "q-1", "queue_reply_anchor": "item"},
+    )
+    actual_source, metadata, anchor = runner._queued_delivery_args(
+        event, source=source, event_message_id="outer",
+    )
+    assert actual_source is queued_source
+    assert anchor == "item"
+    assert metadata["queue_id"] == "q-1"
+    assert metadata.get("telegram_reply_to_message_id") != "outer"
+
+
+def test_queued_delivery_args_cannot_be_overwritten_by_legacy_item_route():
+    runner = object.__new__(GatewayRunner)
+    source = SessionSource.from_dict({
+        "platform": "telegram", "chat_id": "210540672", "message_id": "outer",
+    })
+    queued_source = SessionSource.from_dict({
+        "platform": "telegram", "chat_id": "210540672", "message_id": "item",
+    })
+    event = MessageEvent(
+        text="queued task", source=queued_source, message_id="item",
+        metadata={
+            "queue_id": "q-2",
+            "queue_reply_anchor": "item",
+            "telegram_reply_to_message_id": "neighbour",
+            "reply_to_message_id": "neighbour",
+            "message_id": "neighbour",
+        },
+    )
+    _, metadata, anchor = runner._queued_delivery_args(
+        event, source=source, event_message_id="outer",
+    )
+    assert anchor == "item"
+    assert metadata["queue_reply_anchor"] == "item"
+    assert metadata.get("telegram_reply_to_message_id") != "neighbour"
+    assert metadata.get("reply_to_message_id") != "neighbour"
+    assert metadata.get("message_id") != "neighbour"
+
+
     # sanity: current live spool parses; audit file readable; no content leak
     live = json.loads(Path("/root/.hermes/queued_prompts.json").read_text())
     assert isinstance(live, list)

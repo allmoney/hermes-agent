@@ -22410,6 +22410,52 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception as e:
             logger.warning("Post-stream media extraction failed: %s", e)
 
+    def _queued_delivery_args(
+        self,
+        pending_event: Optional[Any],
+        *,
+        source: SessionSource,
+        event_message_id: Optional[str],
+    ) -> tuple[SessionSource, Dict[str, Any], Optional[str]]:
+        """Routing state for delivering a queued follow-up's own response.
+
+        The turn-level status metadata belongs to the *previous* (already
+        completed) event, so on Telegram it carries that message's
+        ``telegram_reply_to_message_id``. Reusing it for a queued item makes
+        the answer quote a neighbouring task. Build the delivery metadata from
+        the queued event itself and let its persisted per-item anchor win.
+        """
+        if pending_event is None:
+            return source, {}, event_message_id
+        queued_source = getattr(pending_event, "source", None) or source
+        event_meta = dict(getattr(pending_event, "metadata", None) or {})
+        anchor = event_meta.get("queue_reply_anchor") or self._reply_anchor_for_event(
+            pending_event
+        )
+        # Queue metadata is durable item data, but legacy items can contain
+        # session-level routing fields copied from the turn that enqueued them.
+        # Never let those fields overwrite the freshly derived per-item reply
+        # route.  In particular, Telegram's reply id must be this item's
+        # persisted anchor, not a neighbouring turn's value.
+        stale_route_keys = {
+            "telegram_reply_to_message_id",
+            "reply_to_message_id",
+            "message_id",
+        }
+        item_metadata = {
+            key: value for key, value in event_meta.items()
+            if key not in stale_route_keys
+        }
+        metadata = dict(
+            self._thread_metadata_for_source(queued_source, anchor) or {}
+        )
+        metadata.update(item_metadata)
+        if anchor is not None:
+            if metadata.get("thread_id") is not None:
+                metadata["telegram_reply_to_message_id"] = str(anchor)
+            metadata["queue_reply_anchor"] = str(anchor)
+        return queued_source, metadata, anchor
+
     async def _deliver_queued_first_response(
         self,
         response: str,
@@ -29559,12 +29605,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                     "Queued follow-up for session %s: final stream delivery not confirmed; sending first response before continuing.",
                                     session_key or "?",
                                 )
+                            # A queued follow-up must deliver with routing
+                            # state belonging to that exact event.  The turn
+                            # status metadata is built from the outer (already
+                            # completed) event and has no queue_id, so passing
+                            # it here made _deliver_queued_first_response
+                            # disable reply_to and left the stale anchor from
+                            # a neighbouring task on platform fallbacks.
+                            (
+                                _queued_delivery_source,
+                                _queued_delivery_metadata,
+                                _queued_delivery_anchor,
+                            ) = self._queued_delivery_args(
+                                pending_event,
+                                source=source,
+                                event_message_id=event_message_id,
+                            )
                             await self._deliver_queued_first_response(
                                 first_response,
-                                source=source,
+                                source=_queued_delivery_source,
                                 adapter=adapter,
-                                metadata=_status_thread_metadata,
-                                event_message_id=event_message_id,
+                                metadata=_queued_delivery_metadata,
+                                event_message_id=_queued_delivery_anchor,
                                 text_already_delivered=_already_streamed,
                                 deliver_media=not _delivery_result.get("failed"),
                             )
