@@ -129,6 +129,18 @@ def test_durable_item_survives_failed_turn_and_acks_only_on_success(tmp_path, mo
     assert spool.pending() == []
 
 
+def test_failed_provider_error_remains_retryable():
+    """The runner must classify the failed=True envelope before its success gate."""
+    result = {
+        "final_response": "Provider error:\n\nHTTP 502: All keys exhausted",
+        "completed": False,
+        "failed": True,
+        "turn_exit_reason": "all_retries_exhausted_no_response",
+    }
+    assert spool.queued_turn_should_retry(result) is True
+    assert spool.queued_turn_succeeded(result) is False
+
+
 def test_run_sync_result_passthrough_preserves_turn_exit_reason():
     # The reconstructed result dict in gateway/run.py (run_sync) must carry
     # turn_exit_reason through, or the ack predicate can never fire.

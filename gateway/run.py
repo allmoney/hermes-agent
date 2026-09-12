@@ -29528,26 +29528,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 if pending_event is not None:
                     queue_id = (getattr(pending_event, "metadata", None) or {}).get("queue_id")
-                    if (
-                        queue_id
-                        and isinstance(followup_result, dict)
-                        and followup_result.get("completed") is True
-                        and not followup_result.get("failed")
-                    ):
-                        # HANDOFF_PATCH_SEP11_QUEUE_ACK_AUDIT: completed alone
-                        # does not prove that this queued turn reached a model.
+                    if queue_id and isinstance(followup_result, dict):
+                        # A provider-error may be marked failed or omit
+                        # completed; classify it before the success gate.
                         from gateway.queued_prompt_spool import (
                             ack,
                             queued_turn_should_retry,
                             queued_turn_succeeded,
                         )
-                        if queued_turn_succeeded(followup_result):
-                            ack(queue_id)
-                        elif queued_turn_should_retry(followup_result):
+                        if queued_turn_should_retry(followup_result):
                             await self._requeue_provider_failed_event(
                                 next_session_key,
                                 self._adapter_for_source(next_source),
                                 pending_event,
+                            )
+                        elif queued_turn_succeeded(followup_result):
+                            ack(queue_id)
+                        else:
+                            logger.warning(
+                                "Queued turn %s produced no ackable result; keeping pending",
+                                queue_id,
                             )
                 return _preserve_queued_followup_history_offset(result, followup_result)
         finally:
