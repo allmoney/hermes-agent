@@ -33,6 +33,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import tempfile
 import threading
 import time
@@ -166,24 +167,34 @@ def ack(item_id: str | None) -> None:
 
 
 # HANDOFF_PATCH_SEP11_RESULT_CONTRACT: narrow queue-ack success predicate
+_PROVIDER_ERROR_FINAL_RE = re.compile(
+    r"^\s*(?:⚠️\s*)?(?:provider\s+error|provider\s+authentication\s+failed|"
+    r"the\s+model\s+provider\s+is\s+rate-limiting|the\s+model\s+server\s+is\s+not\s+responding)\b",
+    re.IGNORECASE,
+)
+
+
 def queued_turn_succeeded(result: Any) -> bool:
     """Return true only when a queued turn produced a real final result.
 
     ``completed=True`` is not sufficient: finalization can produce synthetic
     fallback text after provider failures, exhaustion, interruption, or
     compaction.  The normal text-response exit is the narrow success contract
-    for durable queue acknowledgement.
+    for durable queue acknowledgement. Gateway-sanitized provider error text
+    must also remain pending even when it carries a text-response exit reason.
     """
     if not isinstance(result, dict):
         return False
     reason = str(result.get("turn_exit_reason") or "")
     final_response = result.get("final_response")
+    response_text = str(final_response or "").strip()
     return (
         result.get("completed") is True
         and not result.get("failed")
         and result.get("interrupted") is not True
         and result.get("partial") is not True
-        and bool(final_response and str(final_response).strip())
+        and bool(response_text)
+        and not _PROVIDER_ERROR_FINAL_RE.match(response_text)
         and reason.startswith("text_response(")
     )
 
