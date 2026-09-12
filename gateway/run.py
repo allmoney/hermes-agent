@@ -22308,20 +22308,34 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # anchor persisted with THIS queue item: event_message_id can be a
         # stale/session-level fallback on mixed delayed/recovery paths.
         _queued_metadata = metadata or {}
-        reply_to_message_id = (
-            _queued_metadata.get("queue_reply_anchor")
-            or event_message_id
-            or getattr(source, "message_id", None)
-        )
+        # Only durable /q deliveries carry queue_id. Do not turn this shared
+        # helper's ordinary media/text calls into replies merely because their
+        # caller supplied an event id. For queued turns, the persisted anchor
+        # is authoritative and must win over any stale session-level id.
+        if _queued_metadata.get("queue_id"):
+            reply_to_message_id = (
+                _queued_metadata.get("queue_reply_anchor")
+                or event_message_id
+                or getattr(source, "message_id", None)
+            )
+        else:
+            reply_to_message_id = None
         if not text_already_delivered:
             text_content = _strip_response_attachments_for_direct_send(response, adapter)
             if text_content:
-                await adapter.send(
-                    source.chat_id,
-                    text_content,
-                    reply_to=reply_to_message_id,
-                    metadata=metadata,
-                )
+                if reply_to_message_id is not None:
+                    await adapter.send(
+                        source.chat_id,
+                        text_content,
+                        reply_to=reply_to_message_id,
+                        metadata=metadata,
+                    )
+                else:
+                    await adapter.send(
+                        source.chat_id,
+                        text_content,
+                        metadata=metadata,
+                    )
 
         # Failed turns still deliver their (normalized failure) text above,
         # but must not upload attachments as if the turn succeeded — mirrors
