@@ -8887,6 +8887,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _reply_anchor = self._reply_anchor_for_event(queued_event)
             if _reply_anchor is not None:
                 _meta["queue_reply_anchor"] = str(_reply_anchor)
+            # Keep the referenced message as durable task context separately
+            # from the reply anchor.  The anchor points to this /queue command
+            # so the eventual answer attaches to the task; these fields tell a
+            # restored turn what the user was referring to.  Persist a bounded
+            # text snapshot because the quoted Telegram message may later be
+            # deleted or unavailable after restart.
+            _quoted_id = getattr(queued_event, "reply_to_message_id", None)
+            if _quoted_id is not None:
+                _meta["quoted_message_id"] = str(_quoted_id)
+                _quoted_text = getattr(queued_event, "reply_to_text", None)
+                if _quoted_text:
+                    _meta["quoted_message_text"] = str(_quoted_text)[:4000]
+                for _attr, _key in (
+                    ("reply_to_author_id", "quoted_author_id"),
+                    ("reply_to_author_name", "quoted_author_name"),
+                ):
+                    _value = getattr(queued_event, _attr, None)
+                    if _value is not None:
+                        _meta[_key] = str(_value)[:500]
+                _meta["quoted_chat_id"] = str(
+                    getattr(queued_event.source, "chat_id", "") or ""
+                )
             _qid = enqueue(
                 session_key=session_key,
                 text=getattr(queued_event, "text", "") or "",
@@ -9006,6 +9028,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return
         from gateway.queued_prompt_spool import (
             ack,
+            mark_served,
+            queued_turn_served,
             queued_turn_should_retry,
             queued_turn_succeeded,
         )
@@ -9013,8 +9037,78 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             await self._requeue_provider_failed_event(session_key, adapter, event)
         elif queued_turn_succeeded(result):
             ack(queue_id)
+        elif queued_turn_served(result):
+            # HANDOFF_PATCH_SEP15_SERVED_LEDGER: the answer was delivered, only the exit
+            # reason was anomalous (max_iterations / partial recovery).
+            # Keep the entry as evidence, stop counting it as undone.
+            mark_served(
+                queue_id,
+                reason="delivered_anomalous_exit",
+                exit_reason=str(result.get("turn_exit_reason") or ""),
+                session_id=str(session_key or ""),
+            )
+            self._log.warning(
+                "Queued turn %s delivered under anomalous exit %r; marked served",
+                queue_id,
+                result.get("turn_exit_reason"),
+            )
         else:
             self._retain_queued_event_after_abort(session_key, adapter, event)
+
+    def _schedule_queued_retry(self, session_key: str, adapter: Any) -> None:
+        """Wake a retained queued head without waiting for new user input.
+
+        Provider failures must not turn a durable queue into a passive ledger.
+        Keep one wake task per session; the durable item remains the source of
+        truth and is acknowledged only by the normal completion contract.
+        """
+        tasks = getattr(self, "_queued_retry_tasks", None)
+        if tasks is None:
+            tasks = self._queued_retry_tasks = {}
+        existing = tasks.get(session_key)
+        if existing is not None and not existing.done():
+            return
+
+        async def _wake() -> None:
+            await asyncio.sleep(0.5)
+            slot = getattr(adapter, "_pending_messages", None)
+            if not isinstance(slot, dict):
+                return
+            event = slot.pop(session_key, None)
+            if event is None or not (getattr(event, "metadata", None) or {}).get("queue_id"):
+                if event is not None:
+                    slot[session_key] = event
+                return
+            try:
+                setattr(event, "_hermes_queued_retry_replay", True)
+                await adapter.handle_message(event)
+                session_tasks = getattr(adapter, "_session_tasks", {})
+                task = session_tasks.get(session_key) if isinstance(session_tasks, dict) else None
+                if task is not None:
+                    await asyncio.shield(task)
+                    await self._settle_direct_queued_event(
+                        session_key, adapter, event, task.result()
+                    )
+            except BaseException:
+                self._retain_queued_event_after_abort(session_key, adapter, event)
+                raise
+
+        task = asyncio.create_task(_wake(), name=f"queued-retry:{session_key}")
+        tasks[session_key] = task
+
+        def _done(completed: "asyncio.Task") -> None:
+            if tasks.get(session_key) is completed:
+                tasks.pop(session_key, None)
+            if completed.cancelled():
+                return
+            exc = completed.exception()
+            if exc is not None:
+                logger.warning(
+                    "Autonomous queued retry failed for %s: %s",
+                    session_key or "?", exc,
+                )
+
+        task.add_done_callback(_done)
 
     async def _requeue_provider_failed_event(
         self,
@@ -9056,6 +9150,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             "Queued provider failure for %s: retry %d/3 scheduled after backoff",
             session_key or "?", attempts + 1,
         )
+        self._schedule_queued_retry(session_key, adapter)
         return True
 
     def _promote_queued_event(
@@ -9108,6 +9203,39 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if adapter is not None and session_key in getattr(adapter, "_pending_messages", {}):
             depth += 1
         return depth
+
+    def _durable_queue_depth(self, session_key: str, *, adapter: Any = None) -> int:
+        """Return pending /queue count from the durable spool when available."""
+        try:
+            from gateway.queued_prompt_spool import pending
+
+            items = pending()
+            ids = {
+                str(item.get("id"))
+                for item in items
+                if isinstance(item, dict)
+                and item.get("session_key") == session_key
+                # HANDOFF_PATCH_SEP15_SERVED_LEDGER: delivered items are not pending work.
+                and not item.get("served_at")
+            }
+            # Older manual queue inserts were bare strings. Attribute those
+            # only when every structured pending item belongs to this one
+            # session; otherwise an unscoped legacy item must never inflate a
+            # different chat's acknowledgement.
+            known_sessions = {
+                str(item.get("session_key"))
+                for item in items
+                if isinstance(item, dict)
+                and item.get("session_key")
+                # HANDOFF_PATCH_SEP15_SERVED_LEDGER
+                and not item.get("served_at")
+            }
+            legacy_count = sum(isinstance(item, str) for item in items)
+            if legacy_count and known_sessions == {session_key}:
+                return len(ids) + legacy_count
+            return len(ids)
+        except Exception:
+            return self._queue_depth(session_key, adapter=adapter)
 
     @staticmethod
     def _is_goal_continuation_event(event_or_text: Any) -> bool:
@@ -10616,8 +10744,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 f"when it finishes (use /stop to cancel everything)."
             )
         elif is_queue_mode:
+            queue_depth = self._durable_queue_depth(
+                session_key, adapter=self._adapter_for_source(event.source)
+            )
             message = (
-                f"⏳ Queued for the next turn{status_detail}. "
+                # HANDOFF_PATCH_SEP17_PENDING_COUNT_WORDING: the durable depth
+                # counts only items whose answer has NOT gone out yet (served
+                # records are excluded), so the ack must say that plainly
+                # instead of the ambiguous "(N queued)", which read as if those
+                # tasks had already been handled.
+                f"⏳ Queued for the next turn. ({queue_depth} still to answer, this one included)"
+                f"{status_detail} "
                 f"I'll respond once the current task finishes."
             )
         else:
@@ -16451,22 +16588,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 timestamp=event.timestamp,
             )
             self._enqueue_fifo(quick_key, queued_event, adapter)
-        depth = self._queue_depth(quick_key, adapter=self._adapter_for_source(source))
         # The durable spool is the source of truth for the count. Live FIFO
         # slots/overflow are projections of the same items and must not be
         # added again (after restore that used to inflate 2 items to 10).
-        try:
-            from gateway.queued_prompt_spool import pending as _pending_queue
-            durable_ids = {
-                str(item.get("id")) for item in _pending_queue()
-                if item.get("session_key") == quick_key
-            }
-            depth = len(durable_ids)
-        except Exception:
-            pass
-        if depth <= 1:
-            return "Queued for the next turn."
-        return f"Queued for the next turn. ({depth} queued)"
+        depth = self._durable_queue_depth(
+            quick_key, adapter=self._adapter_for_source(source)
+        )
+        # HANDOFF_PATCH_SEP17_PENDING_COUNT_WORDING: same readout as the busy
+        # ack — this number is work whose answer has not gone out yet, never a
+        # count of completed asks.
+        return f"Queued for the next turn. ({depth} still to answer)"
 
     async def _busy_steer_command(self, event: MessageEvent, quick_key: str, source):
         # /steer <prompt> — inject mid-run after the next tool call.
@@ -19048,7 +19179,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # model/reasoning overrides, a queued "/model switched" note, or
             # a stale resolved-model cache (#48031, #58403). See
             # _CONVERSATION_SCOPED_STATE.
-            self._clear_conversation_scope(session_key, reason="auto_reset")
+            # HANDOFF_PATCH_SEP14_QUEUE_CARRYOVER: an idle/daily auto-reset
+            # continues the same chat, so durable queued work is carried over
+            # into the fresh session instead of being destroyed at the boundary.
+            self._reattach_carried_over_queue_items(
+                self._clear_conversation_scope(
+                    session_key, reason="auto_reset", carry_over=True
+                ),
+                reason="auto_reset",
+            )
             # Evict the cached agent so the fresh session does not inherit the
             # previous conversation's context_compressor._previous_summary —
             # the cache is keyed on the stable session_key, so an auto-reset
@@ -20388,6 +20527,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             # Normalize empty responses: surface errors, partial failures, and
             # the case where agent did work but returned no text. Fix for #18765.
+            # HANDOFF_PATCH_SEP20_SPLIT_TAIL_RESCUE: keep the RAW final text so
+            # the split-skip rescue below can tell a delivered answer from a
+            # lost one (post-normalize ``response`` is never empty).
+            _raw_final_response = response
             if not _intentional_silence:
                 response = _normalize_empty_agent_response(
                     agent_result, response, history_len=len(history),
@@ -20427,6 +20570,32 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         _run_start_session_id,
                         session_entry.session_id,
                     )
+                    # HANDOFF_PATCH_SEP20_SPLIT_TAIL_RESCUE (P3; 15.09 21:05
+                    # lost-answer incident): the binding moved on before
+                    # compression finished, so this run's rotation is never
+                    # published and the successor resumes from a compaction
+                    # summary. When the run also produced no final text, its
+                    # tool-batch tail sits unanswered in the successor
+                    # transcript and the user sees silence. Enqueue ONE
+                    # deduped durable resume item so the next turn rebuilds
+                    # the half-step instead of dropping it.
+                    if not _intentional_silence and not (
+                        _raw_final_response and str(_raw_final_response).strip()
+                    ):
+                        try:
+                            self._rescue_split_turn_tail(
+                                session_key=session_key or "",
+                                new_session_id=str(
+                                    agent_result.get("session_id") or ""
+                                ),
+                                source=source,
+                            )
+                        except Exception:
+                            logger.warning(
+                                "Split-tail rescue failed for %s",
+                                session_key or "?",
+                                exc_info=True,
+                            )
 
             # Prepend reasoning/thinking if display is enabled (per-platform).
             # Mattermost requires explicit per-platform opt-in because this is
@@ -20646,8 +20815,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # Conversation boundary: one funnel call clears every
                 # conversation-scoped per-session dict (#58403 and siblings).
                 # See _CONVERSATION_SCOPED_STATE.
-                self._clear_conversation_scope(
-                    session_key, reason="compression_exhausted_reset"
+                # HANDOFF_PATCH_SEP14_QUEUE_CARRYOVER: same chat, so the durable
+                # queue is carried across the compression reset.
+                self._reattach_carried_over_queue_items(
+                    self._clear_conversation_scope(
+                        session_key,
+                        reason="compression_exhausted_reset",
+                        carry_over=True,
+                    ),
+                    reason="compression_exhausted_reset",
                 )
                 if new_entry is not None:
                     # Drop the stale reference to the bloated compressed child and
@@ -26588,6 +26764,127 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             logger.debug("Failed to release turn lease", exc_info=True)
             return False
 
+    def _rescue_split_turn_tail(
+        self,
+        *,
+        session_key: str,
+        new_session_id: str,
+        source: Any,
+    ) -> bool:
+        """Enqueue a durable resume turn after a binding-moved split skip.
+
+        HANDOFF_PATCH_SEP20_SPLIT_TAIL_RESCUE (P3). Called from the
+        agent-result flush when the run's session_id rotated mid-turn
+        (compression split) but the routing binding had already moved to a
+        newer session, AND the run produced no final text. The successor
+        session resumes from a compaction summary; this turn's preserved
+        tool-batch tail would otherwise sit unanswered (the 15.09 21:05
+        "lost answer" incident).
+
+        The resume item rides the normal durable /queue machinery:
+        ``_enqueue_fifo`` persists it (spool) and injects it into the live
+        FIFO, so the recursive drain after this turn — or, worst case, the
+        boot drain / the next inbound message — dispatches it as a fresh
+        turn that sees the preserved tail in the transcript and finishes
+        the answer.
+
+        Safety: at most ONE unserved resume item per session (the dedupe
+        below doubles as the loop cap — a resume turn that hits the same
+        race finds its own item still pending and does not enqueue
+        another). Best-effort and non-fatal by contract; returns True when
+        an item was enqueued.
+        """
+        if not session_key or not source:
+            return False
+        try:
+            from gateway.queued_prompt_spool import pending
+            for _item in pending():
+                _meta = _item.get("metadata") or {}
+                if (
+                    str(_item.get("session_key") or "") == str(session_key)
+                    and _meta.get("split_tail_resume")
+                    and not _item.get("served_at")
+                ):
+                    return False  # one in-flight resume per session
+        except Exception:
+            logger.debug(
+                "Split-tail resume dedupe check failed", exc_info=True,
+            )
+            return False
+        _prompt = self._split_tail_resume_prompt(new_session_id)
+        adapter = None
+        try:
+            adapter = self._adapter_for_source(source)
+        except Exception:
+            adapter = None
+        if adapter is None:
+            # No live adapter: durable-only enqueue; boot restore picks it up.
+            try:
+                from gateway.queued_prompt_spool import enqueue
+                _src = source.to_dict() if hasattr(source, "to_dict") else {}
+                enqueue(
+                    session_key=str(session_key),
+                    text=_prompt,
+                    source=_src,
+                    metadata={
+                        "split_tail_resume": True,
+                        "split_tail_resume_session": str(new_session_id or ""),
+                        "queue_reply_anchor": (
+                            str(getattr(source, "message_id", "") or "") or None
+                        ),
+                    },
+                )
+                logger.info(
+                    "Split-tail rescue: durable resume item enqueued for %s "
+                    "(no live adapter)",
+                    session_key,
+                )
+                return True
+            except Exception:
+                logger.warning(
+                    "Split-tail rescue durable-only enqueue failed for %s",
+                    session_key,
+                    exc_info=True,
+                )
+                return False
+        try:
+            from gateway.platforms.base import MessageEvent
+            _anchor = getattr(source, "message_id", None)
+            event = MessageEvent(
+                text=_prompt,
+                source=source,
+                metadata={
+                    "split_tail_resume": True,
+                    "split_tail_resume_session": str(new_session_id or ""),
+                },
+                message_id=str(_anchor) if _anchor is not None else None,
+            )
+            self._enqueue_fifo(session_key, event, adapter)
+            logger.info(
+                "Split-tail rescue: resume turn enqueued for %s (rotated to %s)",
+                session_key,
+                new_session_id or "?",
+            )
+            return True
+        except Exception:
+            logger.warning(
+                "Split-tail rescue failed to enqueue for %s",
+                session_key,
+                exc_info=True,
+            )
+            return False
+
+    def _split_tail_resume_prompt(self, new_session_id: str) -> str:
+        """Bounded prompt text for the resume turn (RU, matches chat style)."""
+        return (
+            "[СИСТЕМА — восстановление прерванного хода] Предыдущий ход "
+            "оборвался посреди tool-батча из-за гонки компрессии/сплита "
+            "сессии; его tool-результаты уже сохранены в транскрипте выше. "
+            "Продолжи ровно с этого места: опирайся на сохранённые "
+            "результаты (не вызывай инструменты заново без необходимости) "
+            "и заверши ответ пользователю по исходной задаче."
+        )
+
     def _rebind_turn_lease(
         self, session_key: str, run_generation: int, new_session_id: str
     ) -> bool:
@@ -26617,7 +26914,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             logger.debug("Failed to rebind turn lease", exc_info=True)
             return False
 
-    def _clear_conversation_scope(self, session_key: str, *, reason: str) -> None:
+    # HANDOFF_PATCH_SEP14_QUEUE_CARRYOVER: boundaries that continue the SAME
+    # chat (user /new or /reset, an auto-reset, the compression-exhausted
+    # reset) must not destroy durable /queue work.  Pass carry_over=True to get
+    # the session's durable items back, then hand them to
+    # _reattach_carried_over_queue_items() so the fresh conversation inherits
+    # the queue and the user is told how many tasks were carried.
+    def _clear_conversation_scope(
+        self, session_key: str, *, reason: str, carry_over: bool = False
+    ) -> list[dict[str, Any]] | None:
         """Clear ALL conversation-scoped per-session state for ``session_key``.
 
         THE single conversation-boundary funnel. Call this — and nothing
@@ -26650,7 +26955,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         access is getattr-guarded).
         """
         if not session_key:
-            return
+            return None
+        _carried: list[dict[str, Any]] = []
+        if carry_over:
+            # HANDOFF_PATCH_SEP14_QUEUE_CARRYOVER: take the durable items BEFORE
+            # the spool clear so the caller can re-attach them to the
+            # conversation that continues after this boundary.  take_session()
+            # archives a snapshot first, so even a failure to re-attach leaves
+            # recoverable work instead of losing it.
+            try:
+                from gateway.queued_prompt_spool import take_session
+                _carried = take_session(session_key, reason=reason)
+            except Exception:
+                logger.exception(
+                    "Failed to take durable /queue items for carry-over (%s)",
+                    session_key,
+                )
+                _carried = []
         try:
             from gateway.queued_prompt_spool import clear_session
             clear_session(session_key)
@@ -26674,6 +26995,37 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         logger.debug(
             "Cleared conversation scope for %s (%s)", session_key, reason
         )
+        return _carried
+
+    def _reattach_carried_over_queue_items(
+        self, items: list[dict[str, Any]] | None, *, reason: str
+    ) -> int:
+        """Re-attach boundary-carried durable /queue items to the live FIFO.
+
+        HANDOFF_PATCH_SEP14_QUEUE_CARRYOVER: called right after a boundary that
+        continues the same chat session_key (auto-reset, compression-exhausted
+        reset, /new).  The items keep their durable ids, source routing and
+        Telegram reply anchor, so the queue resumes in FIFO order in the fresh
+        conversation instead of being silently destroyed.  When no live adapter
+        is available they simply stay durable-pending.
+        """
+        if not items:
+            return 0
+        try:
+            from gateway.queued_prompt_spool import carry_over_requeue
+            reattached = carry_over_requeue(self, items)
+        except Exception:
+            logger.exception(
+                "Failed to re-attach carried-over /queue items after %s", reason
+            )
+            return 0
+        if reattached:
+            logger.info(
+                "Carried over %d durable /queue item(s) across %s — tasks stay queued",
+                reattached,
+                reason,
+            )
+        return reattached
 
     def _clear_session_boundary_security_state(self, session_key: str) -> None:
         """Clear per-session control state that must not survive a boundary switch."""
@@ -29710,6 +30062,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         _queued_item_metadata.get("queue_reply_anchor")
                         or self._reply_anchor_for_event(pending_event)
                     )
+                    # Queued turns share a session with the outer turn, but
+                    # transport code also reads source.message_id when building
+                    # stream/status routes.  Use an isolated source whose only
+                    # reply identity is this durable item's anchor so no stale
+                    # outer-event message id can reach Telegram.
+                    if next_message_id is not None:
+                        next_source = dataclasses.replace(
+                            next_source,
+                            message_id=str(next_message_id),
+                        )
                     next_channel_prompt = getattr(pending_event, "channel_prompt", None)
                     next_message_type = getattr(pending_event, "message_type", None)
 
@@ -29755,6 +30117,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # what the follow-up's guard will consult.  Fail-safe in helper.
                 await self._refresh_agent_cache_message_count(session_key, session_id)
 
+                # sep15 (HANDOFF_PATCH_SEP15_FINAL_REPLY_ANCHOR): the follow-up
+                # text is delivered by the OUTER handler, whose reply anchor is
+                # the busy turn's first message.  Publish this item's anchor so
+                # that delivery quotes the message being answered.
+                _anchor_adapter = self._adapter_for_source(next_source)
+                if _anchor_adapter is not None:
+                    try:
+                        _anchor_adapter.publish_final_reply_anchor(next_session_key, next_message_id)
+                    except Exception:
+                        logger.debug("final reply anchor publish failed", exc_info=True)
+
                 try:
                     followup_result = await self._run_agent(
                         message=next_message,
@@ -29789,6 +30162,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         # completed; classify it before the success gate.
                         from gateway.queued_prompt_spool import (
                             ack,
+                            mark_served,
+                            queued_turn_served,
                             queued_turn_should_retry,
                             queued_turn_succeeded,
                         )
@@ -29800,6 +30175,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             )
                         elif queued_turn_succeeded(followup_result):
                             ack(queue_id)
+                        elif queued_turn_served(followup_result):
+                            # HANDOFF_PATCH_SEP15_SERVED_LEDGER: delivered, anomalous exit.
+                            mark_served(
+                                queue_id,
+                                reason="delivered_anomalous_exit",
+                                exit_reason=str(
+                                    followup_result.get("turn_exit_reason") or ""
+                                ),
+                                session_id=str(session_key or ""),
+                            )
                         else:
                             logger.warning(
                                 "Queued turn %s produced no ackable result; keeping pending",
