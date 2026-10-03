@@ -22641,6 +22641,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         event_message_id: Optional[str] = None,
         text_already_delivered: bool = False,
         deliver_media: bool = True,
+        reply_to_message_id: Optional[str] = None,
     ) -> None:
         """Deliver a queued response using the normal text+attachment split."""
         # HANDOFF_PATCH_SEP12_QUEUE_DELAYED_REPLY: queued/delayed first responses
@@ -22648,18 +22649,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # anchor persisted with THIS queue item: event_message_id can be a
         # stale/session-level fallback on mixed delayed/recovery paths.
         _queued_metadata = metadata or {}
-        # Only durable /q deliveries carry queue_id. Do not turn this shared
-        # helper's ordinary media/text calls into replies merely because their
-        # caller supplied an event id. For queued turns, the persisted anchor
-        # is authoritative and must win over any stale session-level id.
-        if _queued_metadata.get("queue_id"):
-            reply_to_message_id = (
-                _queued_metadata.get("queue_reply_anchor")
-                or event_message_id
-                or getattr(source, "message_id", None)
-            )
-        else:
-            reply_to_message_id = None
+        # HANDOFF_PATCH_OCT03_FIRST_RESPONSE_ANCHOR: the first response is the
+        # answer to the already-completed outer event, while the durable queue
+        # anchor belongs to the follow-up turn that will run afterwards.  The
+        # explicit override prevents a newer queued message from being quoted.
+        if reply_to_message_id is None:
+            # Only durable /q deliveries carry queue_id. Do not turn this shared
+            # helper's ordinary media/text calls into replies merely because their
+            # caller supplied an event id. For queued turns, the persisted anchor
+            # is authoritative and must win over any stale session-level id.
+            if _queued_metadata.get("queue_id"):
+                reply_to_message_id = (
+                    _queued_metadata.get("queue_reply_anchor")
+                    or event_message_id
+                    or getattr(source, "message_id", None)
+                )
+            else:
+                reply_to_message_id = None
         if not text_already_delivered:
             text_content = _strip_response_attachments_for_direct_send(response, adapter)
             if text_content:
@@ -29894,6 +29900,33 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         merge_pending_message_event(adapter._pending_messages, session_key, pending_event)
                     elif adapter and hasattr(adapter, 'queue_message'):
                         adapter.queue_message(session_key, pending)
+                    # HANDOFF_PATCH_SEP28_CAP_DRAIN_SELFWAKE: parking here used to
+                    # leave the rest of a durable /q backlog asleep until the user
+                    # sent another message (or the gateway restarted), so a deep
+                    # queue only advanced on reminders ("продолжай") — in batches of
+                    # _MAX_INTERRUPT_DEPTH. Wake the retained head with the same
+                    # self-scheduler the provider-failure path already uses, capped
+                    # so a non-progressing item cannot spin the wake loop forever.
+                    if adapter is not None and session_key:
+                        _wake_state = getattr(self, "_cap_drain_wakes", None)
+                        if _wake_state is None:
+                            _wake_state = self._cap_drain_wakes = {}
+                        _wk_count, _wk_since = _wake_state.get(
+                            session_key, (0, time.monotonic())
+                        )
+                        _wk_now = time.monotonic()
+                        if _wk_now - _wk_since > 900.0:
+                            _wk_count, _wk_since = 0, _wk_now
+                        _wk_count += 1
+                        _wake_state[session_key] = (_wk_count, _wk_since)
+                        if _wk_count <= 30:
+                            self._schedule_queued_retry(session_key, adapter)
+                        else:
+                            logger.warning(
+                                "Cap-parked /q backlog for %s paused after %d self-wakes "
+                                "in %.0fs; waiting for the next inbound.",
+                                session_key, _wk_count, _wk_now - _wk_since,
+                            )
                     _capped_result = result_holder[0] or {"final_response": response, "messages": history}
                     return _mark_confirmed_stream_delivery(
                         _capped_result,
@@ -29934,9 +29967,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # This direct queued-send branch predates intentional-silence
                     # filtering, so without this check it leaks the literal marker.
                     try:
-                        from gateway.response_filters import is_intentional_silence_agent_result
+                        # HANDOFF_PATCH_SEP28_QUEUED_AUTONOMOUS_SILENCE: also
+                        # consult the autonomous matcher — a replayed cron
+                        # payload keeps cron shapes the strict predicate misses.
+                        from gateway.response_filters import (
+                            is_autonomous_silence_response,
+                            is_intentional_silence_agent_result,
+                        )
                         _intentional_silence = is_intentional_silence_agent_result(
                             _delivery_result, first_response,
+                        ) or (
+                            not _delivery_result.get("failed")
+                            and is_autonomous_silence_response(first_response)
                         )
                     except Exception:
                         _intentional_silence = False
@@ -29973,6 +30015,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 source=source,
                                 event_message_id=event_message_id,
                             )
+                            # HANDOFF_PATCH_OCT03_FIRST_RESPONSE_ANCHOR: the first
+                            # response answers the outer event that just
+                            # completed, so it must quote its message — not the
+                            # durable queue anchor, which belongs to the newer
+                            # follow-up turn that still has to run.
                             await self._deliver_queued_first_response(
                                 first_response,
                                 source=_queued_delivery_source,
@@ -29981,6 +30028,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 event_message_id=_queued_delivery_anchor,
                                 text_already_delivered=_already_streamed,
                                 deliver_media=not _delivery_result.get("failed"),
+                                reply_to_message_id=event_message_id,
                             )
                         except Exception as e:
                             logger.warning("Failed to send first response before queued message: %s", e)
